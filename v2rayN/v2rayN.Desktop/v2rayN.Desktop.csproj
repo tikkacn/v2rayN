@@ -5,7 +5,7 @@
 		<ApplicationIcon>Assets\v2rayN.ico</ApplicationIcon>
 		<BuiltInComInteropSupport>true</BuiltInComInteropSupport>
 		<AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
-		<AssemblyName>v2rayN</AssemblyName>
+		<AssemblyName>V2VG</AssemblyName>
 	</PropertyGroup>
 
 	<ItemGroup>
