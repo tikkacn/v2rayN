@@ -9,7 +9,7 @@
     xmlns:resx="clr-namespace:ServiceLib.Resx;assembly=ServiceLib"
     xmlns:vms="clr-namespace:ServiceLib.ViewModels;assembly=ServiceLib"
     xmlns:view="clr-namespace:v2rayN.Views"
-    Title="v2rayN"
+    Title="V2VG"
     Width="900"
     Height="700"
     MinWidth="900"
@@ -27,7 +27,7 @@
             <BooleanToVisibilityConverter x:Key="BoolToVisConverter" />
         </ResourceDictionary>
     </Window.Resources>
-
+title
     <materialDesign:DialogHost
         materialDesign:TransitionAssist.DisableTransitions="True"
         Identifier="RootDialog"
