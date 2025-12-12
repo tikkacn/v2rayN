@@ -23,7 +23,15 @@ public partial class MainWindow : WindowBase<MainWindowViewModel>
 
         KeyDown += MainWindow_KeyDown;
         menuSettingsSetUWP.Click += MenuSettingsSetUWP_Click;
-        menuPromotion.Click += MenuPromotion_Click;
+        // 不再绑定推广按钮的点击事件，改为隐藏控件
+        try
+        {
+            menuPromotion.IsVisible = false;
+        }
+        catch
+        {
+            // 忽略不存在或其他错误
+        }
         menuCheckUpdate.Click += MenuCheckUpdate_Click;
         menuBackupAndRestore.Click += MenuBackupAndRestore_Click;
         menuClose.Click += MenuClose_Click;
@@ -479,6 +487,8 @@ public partial class MainWindow : WindowBase<MainWindowViewModel>
             ConfigHandler.SaveMainGirdHeight(_config, gridMain1.RowDefinitions[0].ActualHeight, gridMain1.RowDefinitions[2].ActualHeight);
         }
     }
+
+    #endregion UI
 
     private void AddHelpMenuItem()
     {
