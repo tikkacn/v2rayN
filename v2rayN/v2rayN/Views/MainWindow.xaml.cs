@@ -233,7 +233,8 @@ public partial class MainWindow
                 return new GlobalHotkeySettingWindow().ShowDialog() ?? false;
 
             case EViewAction.SubSettingWindow:
-                return new SubSettingWindow((SubItem)obj).ShowDialog() ?? false;
+                // 修正：SubSettingWindow 不带参数的构造函数
+                return new SubSettingWindow().ShowDialog() ?? false;
 
             case EViewAction.ScanScreenTask:
                 await ScanScreenTaskAsync();
