@@ -22,7 +22,15 @@ public partial class MainWindow
         Closing += MainWindow_Closing;
         PreviewKeyDown += MainWindow_PreviewKeyDown;
         menuSettingsSetUWP.Click += MenuSettingsSetUWP_Click;
-        menuPromotion.Click += MenuPromotion_Click;
+        // 不再绑定推广按钮的点击事件，改为隐藏控件
+        try
+        {
+            menuPromotion.Visibility = System.Windows.Visibility.Collapsed;
+        }
+        catch
+        {
+            // 忽略不存在或其他错误
+        }
         menuClose.Click += MenuClose_Click;
         menuCheckUpdate.Click += MenuCheckUpdate_Click;
         menuBackupAndRestore.Click += MenuBackupAndRestore_Click;
@@ -225,7 +233,7 @@ public partial class MainWindow
                 return new GlobalHotkeySettingWindow().ShowDialog() ?? false;
 
             case EViewAction.SubSettingWindow:
-                return new SubSettingWindow().ShowDialog() ?? false;
+                return new SubSettingWindow((SubItem)obj).ShowDialog() ?? false;
 
             case EViewAction.ScanScreenTask:
                 await ScanScreenTaskAsync();
@@ -435,6 +443,8 @@ public partial class MainWindow
         }
     }
 
+    #endregion UI
+
     private void AddHelpMenuItem()
     {
         var coreInfo = CoreInfoManager.Instance.GetCoreInfo();
@@ -459,6 +469,4 @@ public partial class MainWindow
             ProcUtils.ProcessStart(item.Tag.ToString());
         }
     }
-
-    #endregion UI
 }
