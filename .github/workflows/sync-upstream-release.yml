@@ -1,0 +1,203 @@
+name: Sync Upstream Release (v2rayN) + apply patches
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"  # 每6小时检查一次上游 release
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patched-release
+        uses: actions/checkout@v4
+        with:
+          ref: patched-release
+          fetch-depth: 0
+
+      - name: Git config
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Read upstream latest release tag
+        run: |
+          set -e
+          TAG=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/2dust/v2rayN/releases/latest \
+            | jq -r .tag_name)
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Failed to get upstream tag_name."
+            exit 1
+          fi
+
+          echo "UPSTREAM_TAG=$TAG" >> $GITHUB_ENV
+          echo "Upstream latest tag: $TAG"
+
+      - name: Read current synced tag (from patched-release)
+        run: |
+          set -e
+          CUR=""
+          if [ -f .upstream_release_tag ]; then
+            CUR=$(cat .upstream_release_tag | tr -d '\r\n\t ')
+          fi
+          echo "CURRENT_TAG=$CUR" >> $GITHUB_ENV
+          echo "Current synced tag: $CUR"
+
+      - name: Exit if no update
+        run: |
+          set -e
+          if [ "${UPSTREAM_TAG}" = "${CURRENT_TAG}" ]; then
+            echo "No upstream update. Exit."
+            exit 0
+          fi
+          echo "Upstream updated: ${CURRENT_TAG} -> ${UPSTREAM_TAG}"
+
+      - name: Backup workflows (keep ours)
+        run: |
+          set -e
+          mkdir -p /tmp/keep_workflows
+          if [ -d .github/workflows ]; then
+            tar -czf /tmp/keep_workflows/workflows.tgz .github/workflows
+            echo "Backed up .github/workflows"
+          else
+            echo "No .github/workflows to backup"
+          fi
+
+      - name: Add upstream remote & fetch tags
+        run: |
+          set -e
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/2dust/v2rayN.git
+          git fetch upstream --tags --force
+
+      - name: Sync upstream tag -> patched-release (hard reset), then restore workflows
+        run: |
+          set -e
+          git reset --hard "refs/tags/${UPSTREAM_TAG}"
+
+          if [ -f /tmp/keep_workflows/workflows.tgz ]; then
+            rm -rf .github/workflows || true
+            tar -xzf /tmp/keep_workflows/workflows.tgz
+            echo "Restored .github/workflows"
+          fi
+
+      - name: Apply patches (hide promotion + fix SubSettingWindow ctor)
+        run: |
+          set -e
+          python3 - << 'PY'
+          import os, re
+
+          def read(p):
+            with open(p, "r", encoding="utf-8") as f:
+              return f.read()
+
+          def write(p, s):
+            with open(p, "w", encoding="utf-8") as f:
+              f.write(s)
+
+          def ok(m): print("[OK]", m)
+          def warn(m): print("[WARN]", m)
+
+          # Patch A: Avalonia UI promotion menu hide
+          p1 = "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs"
+          if os.path.exists(p1):
+            s = read(p1)
+            orig = s
+
+            # 1) 去掉点击事件绑定：menuPromotion.Click += MenuPromotion_Click;
+            # 2) 加入 try { menuPromotion.IsVisible = false; } catch { }
+            if "menuPromotion.Click +=" in s and "menuPromotion.IsVisible = false" not in s:
+              s = re.sub(
+                r'^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click\s*;\s*$',
+                '            // patched: hide Promotion menu\n'
+                '            try\n'
+                '            {\n'
+                '                menuPromotion.IsVisible = false;\n'
+                '            }\n'
+                '            catch\n'
+                '            {\n'
+                '                // ignore\n'
+                '            }',
+                s,
+                flags=re.M
+              )
+
+            # 如果上游代码变化导致上面没匹配到，但你仍然希望“强制隐藏”
+            if "menuPromotion.IsVisible = false" not in s and "menuPromotion" in s:
+              # 尝试在构造函数里 KeyDown 绑定附近插入（尽量不破坏编译）
+              s = re.sub(
+                r'(\s*menuSettingsSetUWP\.Click\s*\+=\s*MenuSettingsSetUWP_Click\s*;\s*\n)',
+                r'\1'
+                r'            // patched: hide Promotion menu\n'
+                r'            try { menuPromotion.IsVisible = false; } catch { }\n',
+                s,
+                count=1
+              )
+
+            if s != orig:
+              write(p1, s)
+              ok(f"Patched {p1}")
+            else:
+              warn(f"No changes applied to {p1} (maybe already patched or upstream changed)")
+          else:
+            warn(f"File not found: {p1}")
+
+          # Patch B: WPF MainWindow.xaml.cs fix SubSettingWindow ctor
+          p2 = "v2rayN/v2rayN/Views/MainWindow.xaml.cs"
+          if os.path.exists(p2):
+            s = read(p2)
+            orig = s
+
+            s = s.replace(
+              "return new SubSettingWindow((SubItem)obj).ShowDialog() ?? false;",
+              "return new SubSettingWindow().ShowDialog() ?? false;"
+            )
+
+            if s != orig:
+              write(p2, s)
+              ok(f"Patched {p2}")
+            else:
+              warn(f"No changes applied to {p2} (maybe already patched or upstream changed)")
+          else:
+            warn(f"File not found: {p2}")
+
+          PY
+
+      - name: Record synced tag
+        run: |
+          set -e
+          echo "${UPSTREAM_TAG}" > .upstream_release_tag
+
+      - name: Commit changes (if any)
+        run: |
+          set -e
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Sync upstream release ${UPSTREAM_TAG} + apply patches"
+
+      - name: Push patched-release
+        run: |
+          set -e
+          git push origin HEAD:patched-release --force-with-lease
+
+      - name: Trigger Windows build+release (only when updated)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-windows-patched.yml/dispatches \
+            -d "{\"ref\":\"patched-release\"}" >/dev/null
+          echo "Dispatched build-windows-patched.yml on patched-release"
