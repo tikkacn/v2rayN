@@ -25,29 +25,28 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout patched-release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           ref: patched-release
           submodules: recursive
           fetch-depth: 0
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Determine upstream tag (for naming)
+      - name: Determine upstream tag + timestamp (CST)
         run: |
           set -euo pipefail
           UP="${{ inputs.upstream_tag }}"
           if [ -z "$UP" ] && [ -f .upstream_release_tag ]; then
-            UP=$(cat .upstream_release_tag | tr -d '\r\n\t ')
+            UP="$(cat .upstream_release_tag | tr -d '\r\n\t ')"
           fi
           if [ -z "$UP" ]; then UP="unknown"; fi
-          TS=$(date +%Y%m%d-%H%M)
+          TS="$(date +%Y%m%d-%H%M)"
           echo "UP=$UP" >> $GITHUB_ENV
           echo "TS=$TS" >> $GITHUB_ENV
           echo "Upstream=$UP  TS=$TS"
@@ -57,31 +56,27 @@ jobs:
           set -euo pipefail
           cd v2rayN
 
-          # ✅ 关键：构建的是 v2rayN（非 Desktop/Avalonia）项目
           dotnet publish ./v2rayN/v2rayN.csproj \
             -c Release \
             -r win-x64 \
             -p:SelfContained=true \
             -p:EnableWindowsTargeting=true \
-            -o "$OutputPath64"
+            -o "${OutputPath64}"
 
-          # 如果你也想把 AmazTool 一并放进同一个目录（通常上游就是这么做的）
           dotnet publish ./AmazTool/AmazTool.csproj \
             -c Release \
             -r win-x64 \
             -p:SelfContained=true \
             -p:EnableWindowsTargeting=true \
             -p:PublishTrimmed=true \
-            -o "$OutputPath64"
+            -o "${OutputPath64}"
 
       - name: Package zip (SelfContained)
         run: |
           set -euo pipefail
           chmod +x package-release-zip.sh
+          ./package-release-zip.sh "${OutputArch}" "${OutputPath64}"
 
-          ./package-release-zip.sh "$OutputArch" "$OutputPath64"
-
-          # ✅ 你要的“固定文件名”
           mv "v2rayN-${OutputArch}.zip" "v2rayN-windows-64-SelfContained.zip"
 
           mkdir -p dist
@@ -89,7 +84,7 @@ jobs:
           ls -lah dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: v2rayN-windows-64-SelfContained
           path: dist/v2rayN-windows-64-SelfContained.zip
@@ -101,7 +96,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Release tag：patched-<upstreamTag>+<YYYYMMDD-HHmm>
           REL_TAG="${{ inputs.release_tag }}"
           if [ -z "$REL_TAG" ]; then
             REL_TAG="patched-${UP}+${TS}"
