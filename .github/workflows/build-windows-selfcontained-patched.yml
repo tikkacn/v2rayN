@@ -39,19 +39,21 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Determine upstream tag + timestamp (CST)
+        shell: bash
         run: |
           set -euo pipefail
           UP="${{ inputs.upstream_tag }}"
           if [ -z "$UP" ] && [ -f .upstream_release_tag ]; then
-            UP="$(cat .upstream_release_tag | tr -d '\r\n\t ')"
+            UP="$(tr -d '\r\n\t ' < .upstream_release_tag)"
           fi
           if [ -z "$UP" ]; then UP="unknown"; fi
           TS="$(date +%Y%m%d-%H%M)"
-          echo "UP=$UP" >> $GITHUB_ENV
-          echo "TS=$TS" >> $GITHUB_ENV
+          echo "UP=$UP" >> "$GITHUB_ENV"
+          echo "TS=$TS" >> "$GITHUB_ENV"
           echo "Upstream=$UP  TS=$TS"
 
       - name: Build Windows x64 (SelfContained)
+        shell: bash
         run: |
           set -euo pipefail
           cd v2rayN
@@ -61,7 +63,7 @@ jobs:
             -r win-x64 \
             -p:SelfContained=true \
             -p:EnableWindowsTargeting=true \
-            -o "${OutputPath64}"
+            -o "$OutputPath64"
 
           dotnet publish ./AmazTool/AmazTool.csproj \
             -c Release \
@@ -69,13 +71,14 @@ jobs:
             -p:SelfContained=true \
             -p:EnableWindowsTargeting=true \
             -p:PublishTrimmed=true \
-            -o "${OutputPath64}"
+            -o "$OutputPath64"
 
       - name: Package zip (SelfContained)
+        shell: bash
         run: |
           set -euo pipefail
           chmod +x package-release-zip.sh
-          ./package-release-zip.sh "${OutputArch}" "${OutputPath64}"
+          ./package-release-zip.sh "$OutputArch" "$OutputPath64"
 
           mv "v2rayN-${OutputArch}.zip" "v2rayN-windows-64-SelfContained.zip"
 
@@ -93,6 +96,7 @@ jobs:
         if: ${{ inputs.publish_release == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -107,14 +111,8 @@ jobs:
           git push origin -f "$REL_TAG"
 
           NOTES_FILE="$(mktemp)"
-          cat > "$NOTES_FILE" <<EOF
-Upstream: ${UP}
-Patched branch: patched-release
-Commit: $(git rev-parse --short HEAD)
-
-Asset:
-- v2rayN-windows-64-SelfContained.zip
-EOF
+          printf "Upstream: %s\nPatched branch: %s\nCommit: %s\n\nAsset:\n- v2rayN-windows-64-SelfContained.zip\n" \
+            "$UP" "patched-release" "$(git rev-parse --short HEAD)" > "$NOTES_FILE"
 
           if gh release view "$REL_TAG" >/dev/null 2>&1; then
             gh release edit "$REL_TAG" --title "$REL_TITLE" --notes-file "$NOTES_FILE"
