@@ -1,9 +1,9 @@
-name: Sync Upstream Release (apply UI patches)
+name: Sync Upstream Release (v2rayN) + Apply Patches + Trigger Build
 
 on:
   workflow_dispatch:
   schedule:
-    # 每6小时检查一次上游是否发了新 Release；没更新就快速退出
+    # 每 6 小时检查一次上游是否发布了新 Release；没更新就退出，不触发编译
     - cron: "0 */6 * * *"
 
 permissions:
@@ -12,13 +12,17 @@ permissions:
 
 env:
   TZ: Asia/Shanghai
+  UPSTREAM_REPO: 2dust/v2rayN
+  PATCHED_BRANCH: patched-release
+  # 你的构建工作流文件名（要和 .github/workflows/ 里的文件名一致）
+  BUILD_WORKFLOW_FILE: build-windows-selfcontained-patched.yml
 
 jobs:
   sync:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout patched-release
+      - name: Checkout patched-release (target branch)
         uses: actions/checkout@v4
         with:
           ref: patched-release
@@ -29,20 +33,21 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Read upstream latest release tag
+      - name: Get upstream latest release tag
         id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG=$(curl -fsSL \
+          TAG="$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/2dust/v2rayN/releases/latest \
-            | jq -r .tag_name)
-
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+            | jq -r .tag_name)"
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "Failed to get upstream tag_name."
+            echo "Failed to get upstream release tag_name."
             exit 1
           fi
-
           echo "UPSTREAM_TAG=$TAG" >> $GITHUB_ENV
           echo "Upstream latest tag: $TAG"
 
@@ -52,7 +57,7 @@ jobs:
           set -euo pipefail
           CUR=""
           if [ -f .upstream_release_tag ]; then
-            CUR=$(cat .upstream_release_tag | tr -d '\r\n\t ')
+            CUR="$(cat .upstream_release_tag | tr -d '\r\n\t ')"
           fi
           echo "CURRENT_TAG=$CUR" >> $GITHUB_ENV
           echo "Current synced tag: $CUR"
@@ -66,6 +71,7 @@ jobs:
           fi
           echo "Upstream updated: ${CURRENT_TAG} -> ${UPSTREAM_TAG}"
 
+      # 备份 patched-release 当前的 workflows（防止 reset 后把上游 workflows 带进来，导致 push 权限/行为混乱）
       - name: Backup workflows (keep ours)
         run: |
           set -euo pipefail
@@ -81,121 +87,112 @@ jobs:
         run: |
           set -euo pipefail
           git remote remove upstream 2>/dev/null || true
-          git remote add upstream https://github.com/2dust/v2rayN.git
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream --tags --force
-          git fetch upstream --prune --force
 
-      - name: Sync upstream tag -> patched-release (hard reset), then restore workflows
+      - name: Reset patched-release to upstream tag, then restore workflows
         run: |
           set -euo pipefail
           git reset --hard "refs/tags/${UPSTREAM_TAG}"
 
-          # 还原我们自己的 workflows（避免被上游覆盖/删除，且避免 push workflow 权限坑）
+          # 恢复我们自己的 workflows（确保 patched-release 不会混入上游 workflow 文件）
           if [ -f /tmp/keep_workflows/workflows.tgz ]; then
             rm -rf .github/workflows || true
             tar -xzf /tmp/keep_workflows/workflows.tgz
             echo "Restored .github/workflows"
           fi
 
-      - name: Apply UI patches (hide promotion + fix SubSettingWindow ctor)
+      - name: Apply patches (hide promotion + fix SubSettingWindow call)
         run: |
           set -euo pipefail
           python3 - << 'PY'
           import os, re, sys
 
-          def read(path):
-            with open(path, "r", encoding="utf-8") as f:
+          def read(p):
+            with open(p, "r", encoding="utf-8") as f:
               return f.read()
 
-          def write(path, s):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+          def write(p, s):
+            with open(p, "w", encoding="utf-8") as f:
               f.write(s)
 
-          def ok(msg): print("[OK]", msg)
-          def warn(msg): print("[WARN]", msg)
+          def ok(m): print("[OK]", m)
+          def warn(m): print("[WARN]", m)
 
           changed_any = False
 
-          # ---------------- Patch A: hide menuPromotion (Avalonia UI) ----------------
-          # 你的截图对应：v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs
+          # Patch A: v2rayN.Desktop/Views/MainWindow.axaml.cs
           p1 = "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs"
           if os.path.exists(p1):
             s = read(p1)
             orig = s
 
-            # 1) 删除/注释掉 Click 事件绑定：menuPromotion.Click += MenuPromotion_Click;
-            s = re.sub(
-              r'^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click\s*;\s*$',
-              '            // menuPromotion.Click += MenuPromotion_Click; // patched: disable promotion',
-              s,
-              flags=re.M
-            )
-
-            # 2) 在构造函数里（menuSettingsSetUWP.Click 之后）插入隐藏逻辑（如果不存在）
-            if "menuPromotion.IsVisible = false" not in s:
-              anchor = "menuSettingsSetUWP.Click += MenuSettingsSetUWP_Click;"
-              idx = s.find(anchor)
-              if idx != -1:
-                insert_at = idx + len(anchor)
-                insert = (
-                  "\n\n            // patched: hide promotion menu item\n"
-                  "            try\n"
-                  "            {\n"
-                  "                menuPromotion.IsVisible = false;\n"
-                  "            }\n"
-                  "            catch\n"
-                  "            {\n"
-                  "                // ignore\n"
-                  "            }\n"
-                )
-                s = s[:insert_at] + insert + s[insert_at:]
-              else:
-                warn(f"Anchor not found for inserting hide block in {p1}, skip insert")
+            # 1) 移除点击事件绑定：menuPromotion.Click += MenuPromotion_Click;
+            # 2) 改为隐藏控件（幂等：如果已经有 IsVisible=false 就不重复塞）
+            if "menuPromotion.Click +=" in s and "MenuPromotion_Click" in s:
+              block = (
+                "            // 不再绑定推广按钮的点击事件，改为隐藏控件\n"
+                "            try\n"
+                "            {\n"
+                "                menuPromotion.IsVisible = false;\n"
+                "            }\n"
+                "            catch\n"
+                "            {\n"
+                "                // 忽略不存在或其他错误\n"
+                "            }\n"
+              )
+              # 替换整行
+              s = re.sub(r"^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click\s*;\s*$",
+                         block.rstrip("\n"),
+                         s, flags=re.M)
+            else:
+              # 如果已经没有 Click 绑定，但也没有隐藏，补隐藏（尽量插在构造函数里、menuCheckUpdate 前）
+              if "menuPromotion.IsVisible = false" not in s:
+                s = re.sub(r"(\n\s*menuCheckUpdate\.Click\s*\+=\s*MenuCheckUpdate_Click;\s*)",
+                           "\n            // 不再绑定推广按钮的点击事件，改为隐藏控件\n"
+                           "            try\n"
+                           "            {\n"
+                           "                menuPromotion.IsVisible = false;\n"
+                           "            }\n"
+                           "            catch\n"
+                           "            {\n"
+                           "                // 忽略不存在或其他错误\n"
+                           "            }\n\\1",
+                           s, count=1)
 
             if s != orig:
               write(p1, s)
-              ok(f"Patched promotion menu in {p1}")
+              ok(f"Patched: {p1}")
               changed_any = True
             else:
-              warn(f"No changes applied in {p1} (maybe already patched)")
+              warn(f"No change needed: {p1}")
           else:
-            warn(f"File not found: {p1}")
+            warn(f"Not found: {p1}")
 
-          # ---------------- Patch B: fix SubSettingWindow ctor call ----------------
-          # 你的截图对应：v2rayN/v2rayN/Views/MainWindow.xaml.cs
+          # Patch B: v2rayN/Views/MainWindow.xaml.cs
           p2 = "v2rayN/v2rayN/Views/MainWindow.xaml.cs"
           if os.path.exists(p2):
             s = read(p2)
             orig = s
 
-            # 把：new SubSettingWindow((SubItem)obj).ShowDialog() ?? false;
-            # 改成：new SubSettingWindow().ShowDialog() ?? false;
-            s2, n = re.subn(
-              r'return\s+new\s+SubSettingWindow\s*\(\s*\(\s*SubItem\s*\)\s*obj\s*\)\s*\.ShowDialog\(\)\s*\?\?\s*false\s*;',
-              'return new SubSettingWindow().ShowDialog() ?? false;',
-              s
+            # 把：new SubSettingWindow((SubItem)obj).ShowDialog()
+            # 改成：new SubSettingWindow().ShowDialog()
+            s = s.replace(
+              "return new SubSettingWindow((SubItem)obj).ShowDialog() ?? false;",
+              "return new SubSettingWindow().ShowDialog() ?? false;"
             )
-            if n == 0:
-              # 兼容另一种写法：new SubSettingWindow((SubItem)obj)?.ShowDialog() ?? false;
-              s2, n = re.subn(
-                r'return\s+new\s+SubSettingWindow\s*\(\s*\(\s*SubItem\s*\)\s*obj\s*\)\s*\.ShowDialog\(\)\s*\?\?\s*false\s*;',
-                'return new SubSettingWindow().ShowDialog() ?? false;',
-                s
-              )
-            s = s2
 
             if s != orig:
               write(p2, s)
-              ok(f"Patched SubSettingWindow ctor in {p2}")
+              ok(f"Patched: {p2}")
               changed_any = True
             else:
-              warn(f"No changes applied in {p2} (maybe already patched)")
+              warn(f"No change needed: {p2}")
           else:
-            warn(f"File not found: {p2}")
+            warn(f"Not found: {p2}")
 
           if not changed_any:
-            print("[WARN] No patch changes were applied at all.")
+            warn("No patches applied (maybe upstream already matches your patched state).")
           PY
 
       - name: Record synced tag
@@ -211,14 +208,14 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "Sync upstream release ${UPSTREAM_TAG} + apply UI patches"
+          git commit -m "Sync upstream release ${UPSTREAM_TAG} + apply patches"
 
       - name: Push patched-release
         run: |
           set -euo pipefail
-          git push origin HEAD:patched-release --force-with-lease
+          git push origin HEAD:${PATCHED_BRANCH} --force-with-lease
 
-      - name: Trigger Windows SelfContained build (only when updated)
+      - name: Trigger build workflow (only when updated)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -226,6 +223,6 @@ jobs:
           curl -fsSL -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-windows-selfcontained-patched.yml/dispatches \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${BUILD_WORKFLOW_FILE}/dispatches" \
             -d "{\"ref\":\"master\",\"inputs\":{\"upstream_tag\":\"${UPSTREAM_TAG}\",\"publish_release\":\"true\"}}" >/dev/null
           echo "Build workflow dispatched."
