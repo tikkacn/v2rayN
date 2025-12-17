@@ -1,0 +1,102 @@
+name: Build Windows (Patched) + Publish Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Checkout patched-release
+        uses: actions/checkout@v4
+        with:
+          ref: patched-release
+          fetch-depth: 0
+
+      - name: Setup .NET (use global.json if present)
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.nuget\packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets', 'global.json') }}
+
+      - name: Build & Publish Windows Desktop (x64 + arm64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $proj = "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"
+          if (-not (Test-Path $proj)) {
+            throw "Project not found: $proj"
+          }
+
+          dotnet restore $proj
+
+          # win-x64
+          dotnet publish $proj -c Release -r win-x64 --self-contained false
+          $outX64 = Join-Path (Resolve-Path ".") "v2rayN/v2rayN.Desktop/bin/Release"
+          $pubX64 = Get-ChildItem -Recurse -Directory $outX64 | Where-Object { $_.FullName -match "\\win-x64\\publish$" } | Select-Object -First 1
+          if (-not $pubX64) { throw "publish dir not found for win-x64" }
+          $zipX64 = "dist/v2rayN-windows-x64-desktop-patched.zip"
+          if (Test-Path $zipX64) { Remove-Item $zipX64 -Force }
+          Compress-Archive -Path (Join-Path $pubX64.FullName "*") -DestinationPath $zipX64
+
+          # win-arm64
+          dotnet publish $proj -c Release -r win-arm64 --self-contained false
+          $outA64 = Join-Path (Resolve-Path ".") "v2rayN/v2rayN.Desktop/bin/Release"
+          $pubA64 = Get-ChildItem -Recurse -Directory $outA64 | Where-Object { $_.FullName -match "\\win-arm64\\publish$" } | Select-Object -First 1
+          if (-not $pubA64) { throw "publish dir not found for win-arm64" }
+          $zipA64 = "dist/v2rayN-windows-arm64-desktop-patched.zip"
+          if (Test-Path $zipA64) { Remove-Item $zipA64 -Force }
+          Compress-Archive -Path (Join-Path $pubA64.FullName "*") -DestinationPath $zipA64
+
+          Get-ChildItem dist
+
+      - name: Compute Release tag/title (CST)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $up = ""
+          if (Test-Path ".upstream_release_tag") {
+            $up = (Get-Content ".upstream_release_tag" -Raw).Trim()
+          }
+          if ([string]::IsNullOrWhiteSpace($up)) {
+            $up = "unknown"
+          }
+
+          $now = [DateTimeOffset]::Now
+          $stamp = $now.ToString("yyyyMMdd-HHmmss")
+          $tag = "patched-$up+$stamp-CST"
+          $title = "Patched $up ($stamp CST)"
+
+          "UPSTREAM_TAG=$up" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_TITLE=$title" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish GitHub Release (upload dist/*.zip)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TITLE }}
+          body: |
+            Upstream: ${{ env.UPSTREAM_TAG }}
+            Patched branch: patched-release
+            Commit: ${{ github.sha }}
+
+            Assets:
+            - Windows x64 Desktop (patched)
+            - Windows arm64 Desktop (patched)
+          files: |
+            dist/*.zip
