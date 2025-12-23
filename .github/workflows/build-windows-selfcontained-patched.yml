@@ -1,0 +1,122 @@
+name: Build Windows SelfContained (Patched) + Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        required: false
+        type: string
+      publish_release:
+        required: false
+        default: "true"
+        type: string
+      release_tag:
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+  OutputArch: "windows-64"
+  OutputPath64: "${{ github.workspace }}/v2rayN/Release/windows-64"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patched-release
+        uses: actions/checkout@v4
+        with:
+          ref: patched-release
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Determine upstream tag + timestamp (CST)
+        shell: bash
+        run: |
+          set -euo pipefail
+          UP="${{ inputs.upstream_tag }}"
+          if [ -z "$UP" ] && [ -f .upstream_release_tag ]; then
+            UP="$(tr -d '\r\n\t ' < .upstream_release_tag)"
+          fi
+          if [ -z "$UP" ]; then UP="unknown"; fi
+          TS="$(date +%Y%m%d-%H%M)"
+          echo "UP=$UP" >> "$GITHUB_ENV"
+          echo "TS=$TS" >> "$GITHUB_ENV"
+          echo "Upstream=$UP  TS=$TS"
+
+      - name: Build Windows x64 (SelfContained)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd v2rayN
+
+          dotnet publish ./v2rayN/v2rayN.csproj \
+            -c Release \
+            -r win-x64 \
+            -p:SelfContained=true \
+            -p:EnableWindowsTargeting=true \
+            -o "$OutputPath64"
+
+          dotnet publish ./AmazTool/AmazTool.csproj \
+            -c Release \
+            -r win-x64 \
+            -p:SelfContained=true \
+            -p:EnableWindowsTargeting=true \
+            -p:PublishTrimmed=true \
+            -o "$OutputPath64"
+
+      - name: Package zip (SelfContained)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x package-release-zip.sh
+          ./package-release-zip.sh "$OutputArch" "$OutputPath64"
+
+          mv "v2rayN-${OutputArch}.zip" "v2rayN-windows-64-SelfContained.zip"
+
+          mkdir -p dist
+          mv "v2rayN-windows-64-SelfContained.zip" dist/
+          ls -lah dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-windows-64-SelfContained
+          path: dist/v2rayN-windows-64-SelfContained.zip
+
+      - name: Publish GitHub Release (tag + asset)
+        if: ${{ inputs.publish_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REL_TAG="${{ inputs.release_tag }}"
+          if [ -z "$REL_TAG" ]; then
+            REL_TAG="patched-${UP}+${TS}"
+          fi
+          REL_TITLE="Patched ${UP} (${TS} CST)"
+
+          echo "Release tag: $REL_TAG"
+          git tag -f "$REL_TAG"
+          git push origin -f "$REL_TAG"
+
+          NOTES_FILE="$(mktemp)"
+          printf "Upstream: %s\nPatched branch: %s\nCommit: %s\n\nAsset:\n- v2rayN-windows-64-SelfContained.zip\n" \
+            "$UP" "patched-release" "$(git rev-parse --short HEAD)" > "$NOTES_FILE"
+
+          if gh release view "$REL_TAG" >/dev/null 2>&1; then
+            gh release edit "$REL_TAG" --title "$REL_TITLE" --notes-file "$NOTES_FILE"
+            gh release upload "$REL_TAG" dist/*.zip --clobber
+          else
+            gh release create "$REL_TAG" dist/*.zip --title "$REL_TITLE" --notes-file "$NOTES_FILE" --prerelease
+          fi
