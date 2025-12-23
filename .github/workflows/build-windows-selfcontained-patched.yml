@@ -30,8 +30,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: patched-release
-          submodules: recursive
           fetch-depth: 0
+          submodules: false    # 关闭自动递归 submodule
+
+      # 手动只初始化真正需要的 GlobalHotKeys 子模块，避免碰到奇怪的 __wf_master 等路径
+      - name: Init GlobalHotKeys submodule only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init v2rayN/GlobalHotKeys
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
