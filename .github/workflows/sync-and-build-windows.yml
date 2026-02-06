@@ -40,13 +40,12 @@ jobs:
         id: diff
         shell: pwsh
         run: |
-          # 读取上游默认分支（不再猜 main/master）
           $upRef = (git symbolic-ref -q refs/remotes/upstream/HEAD)
           if (-not $upRef) {
             Write-Error "Cannot resolve upstream HEAD"
             exit 1
           }
-          $up = $upRef -replace '^refs/remotes/', ''   # refs/remotes/upstream/master -> upstream/master
+          $up = $upRef -replace '^refs/remotes/', ''
           Write-Host "Upstream default branch: $up"
 
           $behind = git rev-list --count "HEAD..$up"
@@ -86,44 +85,89 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Remove promote entry (auto)
+      - name: Remove promote entry (auto, strong) + Guard
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Remove-PromoteFromXaml([string]$path) {
-            $s = Get-Content -Raw -Encoding UTF8 $path
-            $orig = $s
+          # 只对 WPF 的 XAML 动手
+          $xamlFiles = Get-ChildItem -Recurse -File -Include *.xaml |
+            Where-Object { $_.FullName -match '\\v2rayN\\' }
 
-            # 删除引用 PromoteCommand 的 Button/MenuItem（兼容成对标签）
-            $s = [regex]::Replace($s, '(?s)<Button\b[^>]*\bPromoteCommand\b[^>]*>.*?</Button>', '')
-            $s = [regex]::Replace($s, '(?s)<MenuItem\b[^>]*\bPromoteCommand\b[^>]*>.*?</MenuItem>', '')
+          # 这些关键字/绑定基本能覆盖 WPF 里的“推广/赞助/捐赠”入口
+          $kw = @(
+            "ResUI\.Promote",
+            "PromoteCommand",
+            "\bPromote\b",
+            "推广",
+            "Sponsor",
+            "Donate",
+            "赞助"
+          )
+          $kwRegex = "(" + ($kw -join "|") + ")"
 
-            # 兜底：删除包含“推广”字样的按钮/菜单（有些版本不叫 PromoteCommand）
-            $s = [regex]::Replace($s, '(?s)<Button\b[^>]*>.*?推广.*?</Button>', '')
-            $s = [regex]::Replace($s, '(?s)<MenuItem\b[^>]*>.*?推广.*?</MenuItem>', '')
+          function Strip-PromoControls([string]$text) {
+            $t = $text
 
-            if ($s -ne $orig) {
-              Set-Content -Path $path -Value $s -Encoding UTF8
-              return $true
-            }
-            return $false
+            # 1) 删除自闭合控件：<Button ... />
+            $t = [regex]::Replace(
+              $t,
+              "(?is)<(Button|MenuItem|ToggleButton)\b[^>]*$kwRegex[^>]*/\s*>",
+              ""
+            )
+
+            # 2) 删除成对控件：<Button ...> ... </Button>
+            $t = [regex]::Replace(
+              $t,
+              "(?is)<(Button|MenuItem|ToggleButton)\b[^>]*$kwRegex[^>]*>.*?</\1>",
+              ""
+            )
+
+            # 3) 兜底：关键字在内部绑定/内容里
+            $t = [regex]::Replace(
+              $t,
+              "(?is)<(Button|MenuItem|ToggleButton)\b[^>]*>.*?$kwRegex.*?</\1>",
+              ""
+            )
+
+            return $t
           }
 
           $changed = 0
-          Get-ChildItem -Recurse -File -Include *.xaml |
-            Where-Object { $_.FullName -match '\\v2rayN\\' } |
-            ForEach-Object {
-              if (Remove-PromoteFromXaml $_.FullName) {
-                Write-Host "✅ removed promote in $($_.FullName)"
-                $changed++
-              }
-            }
+          foreach ($f in $xamlFiles) {
+            $s = Get-Content -Raw -Encoding UTF8 $f.FullName
+            $orig = $s
 
-          if ($changed -eq 0) {
-            Write-Host "⚠️ No promote entry matched. Upstream may have renamed it."
-            # 如需严格防回归可改为：exit 1
+            # 快速筛选：没关键字就跳过
+            if ($s -notmatch $kwRegex) { continue }
+
+            $s2 = Strip-PromoControls $s
+
+            if ($s2 -ne $orig) {
+              Set-Content -Path $f.FullName -Value $s2 -Encoding UTF8
+              Write-Host "✅ removed promo UI in $($f.FullName)"
+              $changed++
+            }
           }
+
+          Write-Host "Changed XAML files: $changed"
+
+          # ===== Guard：确保 UI 层不再出现推广入口（只检查 v2rayN 下的 XAML）=====
+          $hits = @()
+          foreach ($p in $kw) {
+            $out = & git grep -n $p -- v2rayN -- '*.xaml' 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out) {
+              $hits += "❌ Found '$p' in XAML:`n$out"
+            }
+          }
+
+          if ($hits.Count -gt 0) {
+            $hits | ForEach-Object { Write-Host $_ }
+            Write-Error "Promo entry still exists in XAML. Failing build."
+            exit 1
+          }
+
+          Write-Host "✅ Guard passed: no promo keywords in XAML"
 
       - name: Locate WPF csproj
         id: locate
