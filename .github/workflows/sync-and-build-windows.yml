@@ -1,24 +1,30 @@
-name: Windows Desktop (No-Promo)
+name: Sync + Build + Release (Windows x64 No-Promo)
 
 on:
   workflow_dispatch:
     inputs:
+      force_build:
+        description: "Force build even if no upstream changes"
+        required: false
+        type: boolean
+        default: false
       release_tag:
-        description: "Release tag (e.g. v7.18.0-nopromo)"
+        description: "Release tag to publish (leave empty to skip release). Example: v7.18.0-nopromo"
         required: false
         type: string
+        default: ""
   push:
     branches:
       - master
 
 env:
-  OutputArch: "windows-64"
-  OutputArchArm: "windows-arm64"
-  OutputPath64: "${{ github.workspace }}/v2rayN/Release/windows-64"
-  OutputPathArm64: "${{ github.workspace }}/v2rayN/Release/windows-arm64"
+  UPSTREAM_REPO: "2dust/v2rayN"
+  UPSTREAM_BRANCH: "master"
+  OUT_DIR: "${{ github.workspace }}/v2rayN/Release/windows-64"
+  OUT_ARCH: "windows-64"
 
 jobs:
-  build:
+  sync_and_build:
     runs-on: ubuntu-latest
 
     steps:
@@ -28,73 +34,175 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Add upstream (2dust/v2rayN)
+      - name: Configure git identity
         run: |
-          git remote add upstream https://github.com/2dust/v2rayN.git || true
-          git fetch upstream
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge upstream
+      - name: Add & fetch upstream
         run: |
-          git merge upstream/master --no-edit || true
-          git push origin HEAD || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream --prune
+
+      - name: Detect upstream changes
+        id: diff
+        run: |
+          set -euo pipefail
+          # 当前分支名（兼容 master/main）
+          CUR="${GITHUB_REF_NAME}"
+          echo "cur=$CUR" >> "$GITHUB_OUTPUT"
+
+          # 计算 upstream 与当前 HEAD 的差异提交数
+          BEHIND=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}" || echo "0")
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream ahead by $BEHIND commits"
+
+      - name: Exit if no upstream updates (unless forced)
+        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
+        run: |
+          echo "No upstream updates. Exit."
+          exit 0
+
+      - name: Merge upstream & push (only if changed)
+        if: steps.diff.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          git merge "upstream/${UPSTREAM_BRANCH}" --no-edit
+          git push origin HEAD
 
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
 
-      - name: Build v2rayN Desktop
+      # ========= 核心：构建前强制去掉 Promotion（UI + code-behind） =========
+      - name: Remove Promotion menu item (auto, robust) + Guard
         run: |
+          set -euo pipefail
+
+          # 1) 自动定位 MainWindow.axaml/xaml
+          MW="$(git ls-files | grep -E 'v2rayN\.Desktop/Views/MainWindow\.(a)?xaml$' | head -n 1 || true)"
+          if [ -z "$MW" ]; then
+            echo "ERROR: Cannot locate MainWindow.axaml/xaml under v2rayN.Desktop/Views/"
+            git ls-files | grep -i 'MainWindow' || true
+            exit 1
+          fi
+          echo "Main window markup: $MW"
+
+          # 2) code-behind 自动定位（.axaml.cs / .xaml.cs）
+          MWCS="${MW}.cs"
+          if [ ! -f "$MWCS" ]; then
+            # 兼容某些项目 code-behind 命名不同（尽量找同目录下 MainWindow*.cs）
+            MWCS="$(dirname "$MW")/MainWindow*.cs"
+          fi
+
+          # 3) 用 python 做“精确删除”避免 sed 破坏格式/编码
+          python3 - <<'PY'
+          import os, re, glob
+
+          mw = os.environ.get("MW")
+          if not mw or not os.path.exists(mw):
+            raise SystemExit("MW not found")
+
+          # 删除 <MenuItem x:Name="menuPromotion" ... />
+          s = open(mw, "r", encoding="utf-8", errors="ignore").read().splitlines(True)
+          out = []
+          removed = 0
+          for line in s:
+            if re.search(r'\bx:Name\s*=\s*"menuPromotion"\b', line):
+              removed += 1
+              continue
+            out.append(line)
+          open(mw, "w", encoding="utf-8").write("".join(out))
+          print(f"Removed menuPromotion lines from {mw}: {removed}")
+
+          # code-behind 清理：删掉/注释所有 menuPromotion 引用行
+          # 目标文件：优先 MW.cs；否则扫描 v2rayN.Desktop/Views 下所有 cs
+          candidates = []
+          mwcs = mw + ".cs"
+          if os.path.exists(mwcs):
+            candidates = [mwcs]
+          else:
+            candidates = glob.glob(os.path.join(os.path.dirname(mw), "*.cs"))
+
+          for f in candidates:
+            txt = open(f, "r", encoding="utf-8", errors="ignore").read().splitlines(True)
+            changed = 0
+            out2 = []
+            for line in txt:
+              if "menuPromotion" in line:
+                # 尽量不制造语法错误：整行注释掉
+                out2.append("// [nopromo] removed by workflow: " + line)
+                changed += 1
+              else:
+                out2.append(line)
+            if changed:
+              open(f, "w", encoding="utf-8").write("".join(out2))
+              print(f"Commented menuPromotion refs in {f}: {changed}")
+          PY
+        env:
+          MW: ${{ env.MW }}
+
+      - name: Guard - menuPromotion must not exist
+        run: |
+          set -euo pipefail
+          # 只要还出现 menuPromotion，就直接 fail（防回归）
+          if git grep -n "menuPromotion" -- "v2rayN/v2rayN.Desktop" ; then
+            echo "ERROR: menuPromotion still exists after cleanup."
+            exit 1
+          fi
+          echo "Guard passed: menuPromotion not found."
+
+      # ========= Build（只做 x64） =========
+      - name: Publish v2rayN Desktop (win-x64, self-contained)
+        run: |
+          set -euo pipefail
           cd v2rayN
+          mkdir -p "$OUT_DIR"
           dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true \
             -p:EnableWindowsTargeting=true \
-            -o $OutputPath64
+            -o "$OUT_DIR"
 
-          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
-            -c Release -r win-arm64 \
-            -p:SelfContained=true \
-            -p:EnableWindowsTargeting=true \
-            -o $OutputPathArm64
-
-      - name: Build AmazTool
+      - name: Publish AmazTool (win-x64, self-contained, trimmed)
         run: |
+          set -euo pipefail
           cd v2rayN
           dotnet publish ./AmazTool/AmazTool.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true \
             -p:EnableWindowsTargeting=true \
             -p:PublishTrimmed=true \
-            -o $OutputPath64
+            -o "$OUT_DIR"
 
-          dotnet publish ./AmazTool/AmazTool.csproj \
-            -c Release -r win-arm64 \
-            -p:SelfContained=true \
-            -p:EnableWindowsTargeting=true \
-            -p:PublishTrimmed=true \
-            -o $OutputPathArm64
-
-      - name: Upload build artifacts
+      - name: Upload build artifacts (raw publish dir)
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayN-windows-desktop-nopromo
-          path: v2rayN/Release/windows*
+          name: v2rayN-windows-64-nopromo
+          path: v2rayN/Release/windows-64
 
-      - name: Package release zip
-        if: github.event.inputs.release_tag != ''
+      # ========= Package（用官方脚本生成“像原版”的 zip，通常会带 bin 等结构） =========
+      - name: Package release zip (same style as upstream)
+        id: pack
         run: |
+          set -euo pipefail
           chmod +x package-release-zip.sh
-          ./package-release-zip.sh $OutputArch $OutputPath64
-          mv v2rayN-${OutputArch}.zip v2rayN-${OutputArch}-desktop-nopromo.zip
-          ./package-release-zip.sh $OutputArchArm $OutputPathArm64
-          mv v2rayN-${OutputArchArm}.zip v2rayN-${OutputArchArm}-desktop-nopromo.zip
+          ./package-release-zip.sh "$OUT_ARCH" "$OUT_DIR"
+          # 统一命名（NoPromo）
+          mv "v2rayN-${OUT_ARCH}.zip" "v2rayN-${OUT_ARCH}-desktop-nopromo.zip"
+          echo "zip=v2rayN-${OUT_ARCH}-desktop-nopromo.zip" >> "$GITHUB_OUTPUT"
 
-      - name: Upload release zip
+      - name: Upload packaged zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-${{ env.OUT_ARCH }}-desktop-nopromo-zip
+          path: ${{ steps.pack.outputs.zip }}
+
+      - name: Upload zip to GitHub Release (optional)
         if: github.event.inputs.release_tag != ''
         uses: svenstaro/upload-release-action@v2
         with:
-          file: v2rayN-*-desktop-nopromo.zip
+          file: ${{ steps.pack.outputs.zip }}
           tag: ${{ github.event.inputs.release_tag }}
-          file_glob: true
           prerelease: false
