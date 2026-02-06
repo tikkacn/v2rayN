@@ -60,7 +60,8 @@ jobs:
           set -euo pipefail
           UPREF="$(git symbolic-ref -q refs/remotes/upstream/HEAD || true)"
           if [ -z "${UPREF}" ]; then
-            echo "Cannot resolve upstream HEAD"; exit 1
+            echo "Cannot resolve upstream HEAD" >&2
+            exit 1
           fi
           UP="${UPREF#refs/remotes/}"
           echo "up=$UP" >> "$GITHUB_OUTPUT"
@@ -97,7 +98,7 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Remove Promotion menu item (menuPromotion) + cleanup code-behind
+      - name: Remove Promotion menu item (menuPromotion) + cleanup code-behind (no YAML-indent risks)
         shell: bash
         run: |
           set -euo pipefail
@@ -106,7 +107,6 @@ jobs:
           AXAML=""
           CS=""
 
-          # Prefer known path pattern in this repo
           if [ -f "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml" ]; then
             AXAML="v2rayN/v2rayN.Desktop/Views/MainWindow.axaml"
           fi
@@ -114,7 +114,6 @@ jobs:
             CS="v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs"
           fi
 
-          # Fallback: search tracked files
           if [ -z "$AXAML" ]; then
             AXAML="$(git ls-files | grep -E '(^|/)v2rayN\.Desktop/Views/MainWindow\.axaml$' | head -n 1 || true)"
           fi
@@ -134,56 +133,10 @@ jobs:
           echo "AXAML=$AXAML"
           echo "CS=$CS"
 
-          # --- write a small python patcher (avoid YAML heredoc pitfalls) ---
-          cat > /tmp/remove_promo.py <<'PY'
-import re
-import sys
-from pathlib import Path
+          # --- write python patcher via base64 (no heredoc indentation pitfalls) ---
+          PY_B64="aW1wb3J0IHJlCmltcG9ydCBzeXMKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpheGFtbF9wYXRoID0gUGF0aChzeXMuYXJndlsxXSkKY3NfcGF0aCAgID0gUGF0aChzeXMuYXJndlsyXSkKCnggPSBheGFtbF9wYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiLCBlcnJvcnM9Imlnbm9yZSIpCgojIFJlbW92ZSBzZWxmLWNsb3NpbmcgTWVudUl0ZW0geDpOYW1lPSJtZW51UHJvbW90aW9uIgpwYXQxID0gcmUuY29tcGlsZShyJyg/bSleW1x0XSAqPE1lbnVJdGVtXFxiW14+XSpcYng6TmFtZVxzKj1ccyoibWVudVByb21vdGlvbiJbXj5dKi8+W1x0XSAqXHI/XG4/JykKeDIgPSBwYXQxLnN1YigiIiwgeCkKCiMgUmVtb3ZlIG5vbi1zZWxmLWNsb3NpbmcgTWVudUl0ZW0gKGRlZmVuc2l2ZSkKcGF0MiA9IHJlLmNvbXBpbGUocicoP21zKV5bXHQgXSo8TWVudUl0ZW1cYltePl0qXGJ4Ok5hbWVccyo9XHMqIm1lbnVQcm9tb3Rpb24iW14+XSo+Lio/PC9NZW51SXRlbT5bXHQgXSpcHI9XG4/JykKeDIgPSBwYXQyLnN1YigiIiwgeDIpCgppZiByZS5zZWFyY2gociJcYng6TmFtZVxzKj1ccyoibWVudVByb21vdGlvbiJcYiIsIHgyKToKICAgIHJhaXNlIFN5c3RlbUV4aXQoIkVSUk9SOiBtZW51UHJvbW90aW9uIHN0aWxsIGV4aXN0cyBpbiBNYWluV2luZG93LmF4YW1sIGFmdGVyIGNsZWFudXAiKQoKaWYgeDIgPT0geDoKICAgIHJhaXNlIFN5c3RlbUV4aXQoIkVSUk9SOiBtZW51UHJvbW90aW9uIG5vdCByZW1vdmVkIGZyb20gTWFpbldpbmRvdy5heGFtbCAobWFya3VwIGNoYW5nZWQ/KSIpCgpheGFtbF9wYXRoLndyaXRlX3RleHQoeDIsIGVuY29kaW5nPSJ1dGYtOCIsIG5ld2xpbmU9IlxuIikKcHJpbnQoIk9LOiBtZW51UHJvbW90aW9uIHJlbW92ZWQgZnJvbSBYQU1MIikKCmMgPSBjc19wYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiLCBlcnJvcnM9Imlnbm9yZSIpCgojIDEpIHJlbW92ZSBhbnkgbGluZSB0aGF0IHJlZmVyZW5jZXMgbWVudVByb21vdGlvbgpjMiA9IHJlLnN1YihyIig/bSleW15cbl0qXGJtZW51UHJvbW90aW9uXGJbXlxuXSpcbiIsICIiLCBjKQoKIyAyKSByZW1vdmUgTWVudVByb21vdGlvbl9DbGljayBtZXRob2QgaWYgZXhpc3RzC2MyID0gcmUuc3ViKAogICAgcic(?ms)^\\s*(?:private|public|protected|internal)?\\s*(?:async\\s+)?void\\s+MenuPromotion_Click\\s*\\([^)]*\\)\\s*\\{.*?\\}\\s*\\n?',CiAgICAiIiwKICAgIGMyCikKCmlmIHJlLnNlYXJjaChyIlxi bWVudVByb21vdGlvblxiIiwgYzIsIGZsYWdzPXJlLlgtcmUpOgogICAgcGFzcwoKIyBHdWFyZDogbm8gcmVtYWluaW5nIG1lbnVQcm9tb3Rpb24gaWRlbnRpZmllcgpzaWZlciA9IHJlLnNlYXJjaChyIlxi bWVudVByb21vdGlvblxiIiwgYzIpCmlmIHNpZmVyOgogICAgcmFpc2UgU3lzdGVtRXhpdCgiRVJST1I6IG1lbnVQcm9tb3Rpb24gc3RpbGwgcmVmZXJlbmNlZCBpbiBNYWluV2luZG93LmF4YW1sLmNzIGFmdGVyIGNsZWFudXAiKQoKY3NfcGF0aC53cml0ZV90ZXh0KGMyLCBlbmNvZGluZz0idXRmLTgiLCBuZXdsaW5lPSJcbiIpCnByaW50KCJPSzogY29kZS1iZWhpbmQgY2xlYW5lZCIpCg=="
 
-axaml_path = Path(sys.argv[1])
-cs_path    = Path(sys.argv[2])
-
-x = axaml_path.read_text(encoding="utf-8", errors="ignore")
-
-# Remove self-closing MenuItem x:Name="menuPromotion"
-pat1 = re.compile(r'(?m)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>[ \t]*\r?\n?')
-x2 = pat1.sub("", x)
-
-# Remove non-self-closing MenuItem (defensive)
-pat2 = re.compile(r'(?ms)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>[ \t]*\r?\n?')
-x2 = pat2.sub("", x2)
-
-if x2 == x:
-    raise SystemExit("ERROR: menuPromotion not removed from MainWindow.axaml (markup changed?)")
-
-# Guard: must be gone
-if re.search(r'\bx:Name\s*=\s*"menuPromotion"\b', x2):
-    raise SystemExit("ERROR: menuPromotion still exists in MainWindow.axaml after cleanup")
-
-axaml_path.write_text(x2, encoding="utf-8", newline="\n")
-print("OK: menuPromotion removed from XAML")
-
-c = cs_path.read_text(encoding="utf-8", errors="ignore")
-
-# 1) remove any whole line that references menuPromotion
-c2 = re.sub(r'(?m)^[^\n]*\bmenuPromotion\b[^\n]*\n', "", c)
-
-# 2) remove MenuPromotion_Click method if exists (common patterns)
-#    matches: void MenuPromotion_Click(...) { ... }
-c2 = re.sub(
-    r'(?ms)^\s*(?:private|public|protected|internal)?\s*(?:async\s+)?void\s+MenuPromotion_Click\s*\([^)]*\)\s*\{.*?\}\s*\n?',
-    "",
-    c2
-)
-
-# 3) guard: no remaining identifier
-if re.search(r'\bmenuPromotion\b', c2):
-    raise SystemExit("ERROR: menuPromotion still referenced in MainWindow.axaml.cs after cleanup")
-
-cs_path.write_text(c2, encoding="utf-8", newline="\n")
-print("OK: code-behind cleaned")
-PY
-
+          echo "$PY_B64" | base64 -d > /tmp/remove_promo.py
           python3 /tmp/remove_promo.py "$AXAML" "$CS"
 
       - name: Prepare output dir (match upstream layout)
@@ -227,7 +180,6 @@ PY
           cd "${GITHUB_WORKSPACE}"
           chmod +x package-release-zip.sh
           ./package-release-zip.sh "${OUT_ARCH}" "${OUT_DIR}"
-          # upstream output: v2rayN-windows-64.zip
           mv "v2rayN-${OUT_ARCH}.zip" "v2rayN-${OUT_ARCH}-noads.zip"
 
       - name: Upload packaged zip artifact
@@ -242,7 +194,6 @@ PY
         with:
           file: v2rayN-windows-64-noads.zip
           tag: ${{ inputs.release_tag }}
-          file_glob: false
           prerelease: false
           overwrite: true
           body: |
