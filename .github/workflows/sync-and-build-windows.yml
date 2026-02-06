@@ -3,7 +3,7 @@ name: sync_and_build_windows
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -17,10 +17,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout current repo
+      - name: Checkout repo (with submodules)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Configure git
         shell: pwsh
@@ -31,10 +32,8 @@ jobs:
       - name: Fetch upstream
         shell: pwsh
         run: |
-          # 添加 upstream（已存在则忽略）
           git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
           git fetch upstream --prune
-          # 让 upstream/HEAD 指向默认分支（main/master 都能兼容）
           git remote set-head upstream -a
 
       - name: Detect upstream changes
@@ -44,26 +43,19 @@ jobs:
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
           if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
-          Write-Host "Upstream HEAD is $up"
-
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Upstream ahead by $behind commits"
 
       - name: Exit if no upstream updates
         if: steps.diff.outputs.behind == '0'
         shell: pwsh
-        run: |
-          Write-Host "No upstream updates. Exit."
-          exit 0
+        run: exit 0
 
       - name: Merge upstream & push
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
-
           git merge --no-edit $up
           git push origin HEAD
 
@@ -76,75 +68,32 @@ jobs:
         id: locate_axaml
         shell: pwsh
         run: |
-          # 自动查找 MainWindow.axaml，避免路径层级变化（比如多一层 v2rayN/）
-          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" | Where-Object {
-            $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$"
-          } | Select-Object -First 1
-
-          if (-not $axaml) {
-            Write-Error "MainWindow.axaml not found under v2rayN.Desktop/Views"
-            exit 1
-          }
-
+          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
+            Select-Object -First 1
+          if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
           "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Found MainWindow.axaml: $($axaml.FullName)"
 
-      - name: Remove Promotion menu item (menuPromotion)
+      - name: Remove Promotion menu item
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           $file = "${{ steps.locate_axaml.outputs.axaml }}"
-          if (!(Test-Path $file)) {
-            Write-Error "Target file not found: $file"
-            exit 1
-          }
-
           $content = Get-Content $file -Raw -Encoding UTF8
-
-          # 1) 优先删“整行 MenuItem”
-          $patternLine = '^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          $new = [regex]::Replace(
-            $content,
-            $patternLine,
-            '',
-            [System.Text.RegularExpressions.RegexOptions]::Multiline
-          )
-
-          # 2) 兜底：不是整行时，做宽松替换
+          $pattern = '^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $new = [regex]::Replace($content, $pattern, '', 'Multiline')
           if ($new -eq $content) {
-            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
-            $new = [regex]::Replace($content, $patternAny, '')
+            $new = [regex]::Replace($content, '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '')
           }
-
-          if ($new -eq $content) {
-            Write-Error "menuPromotion not removed (pattern not matched). Upstream may have changed markup."
-            exit 1
-          }
-
+          if ($new -eq $content) { Write-Error "menuPromotion not removed"; exit 1 }
           Set-Content $file $new -Encoding UTF8
-
-          # Guard：必须确保彻底删除
-          $check = Get-Content $file -Raw -Encoding UTF8
-          if ($check -match 'x:Name\s*=\s*"menuPromotion"') {
-            Write-Error "menuPromotion still exists after edit."
-            exit 1
-          }
-
-          Write-Host "✅ menuPromotion removed successfully."
 
       - name: Locate v2rayN.Desktop.csproj
         id: locate_csproj
         shell: pwsh
         run: |
-          # 自动定位 v2rayN.Desktop.csproj，避免目录层级变化
           $csproj = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
-          if (-not $csproj) {
-            Write-Error "v2rayN.Desktop.csproj not found"
-            exit 1
-          }
+          if (-not $csproj) { Write-Error "csproj not found"; exit 1 }
           "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Using csproj: $($csproj.FullName)"
 
       - name: Restore
         shell: pwsh
@@ -162,9 +111,8 @@ jobs:
       - name: Zip artifact
         shell: pwsh
         run: |
-          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           New-Item dist -ItemType Directory -Force | Out-Null
-          Compress-Archive -Path publish\* -DestinationPath dist\v2rayN-windows-64.zip -Force
+          Compress-Archive publish\* dist\v2rayN-windows-64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
