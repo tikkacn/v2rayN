@@ -19,53 +19,58 @@ jobs:
           fetch-depth: 0
 
       - name: Configure git
+        shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Fetch upstream
+        shell: pwsh
         run: |
-          git remote add upstream https://github.com/2dust/v2rayN.git || true
+          git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
           git fetch upstream --prune
 
       - name: Detect upstream changes
         id: diff
-        shell: bash
+        shell: pwsh
         run: |
-          CUR="${GITHUB_REF_NAME}"
-          if git show-ref --verify --quiet refs/remotes/upstream/master; then
-            UP="upstream/master"
-          else
-            UP="upstream/main"
-          fi
+          $cur = $env:GITHUB_REF_NAME
 
-          BEHIND=$(git rev-list --count HEAD..$UP)
-          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          if (git show-ref --verify --quiet refs/remotes/upstream/master) {
+            $up = "upstream/master"
+          } else {
+            $up = "upstream/main"
+          }
 
-          if [ "$BEHIND" -eq 0 ]; then
-            echo "No upstream updates"
-          else
-            echo "Upstream ahead by $BEHIND commits"
-          fi
+          $behind = git rev-list --count "HEAD..$up"
+          "behind=$behind" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          if ($behind -eq 0) {
+            Write-Host "No upstream updates"
+          } else {
+            Write-Host "Upstream ahead by $behind commits"
+          }
 
       - name: Exit if no upstream updates
         if: steps.diff.outputs.behind == '0'
+        shell: pwsh
         run: |
-          echo "✅ No updates, stop workflow"
+          Write-Host "✅ No updates, stop workflow"
           exit 0
 
       - name: Merge upstream & push
+        shell: pwsh
         run: |
-          if git show-ref --verify --quiet refs/remotes/upstream/master; then
-            UP="upstream/master"
-          else
-            UP="upstream/main"
-          fi
+          if (git show-ref --verify --quiet refs/remotes/upstream/master) {
+            $up = "upstream/master"
+          } else {
+            $up = "upstream/main"
+          }
 
-          git merge --no-edit "$UP"
+          git merge --no-edit $up
           git push origin HEAD
 
-      # ===== 到这里为止：同步完成 =====
+      # ===== 同步完成，下面开始构建 =====
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -106,25 +111,29 @@ jobs:
         shell: pwsh
         run: |
           $csproj = Get-ChildItem -Recurse -Filter v2rayN.csproj | Select-Object -First 1
-          if (-not $csproj) { Write-Host "csproj not found"; exit 1 }
+          if (-not $csproj) { Write-Error "v2rayN.csproj not found"; exit 1 }
           "csproj=$($csproj.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Restore
+        shell: pwsh
         run: dotnet restore "${{ steps.locate.outputs.csproj }}"
 
       - name: Publish (win-x64, self-contained)
+        shell: pwsh
         run: |
           dotnet publish "${{ steps.locate.outputs.csproj }}" `
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
+            -p:PublishSingleFile=false `
+            -p:PublishTrimmed=false `
             -o publish
 
       - name: Zip
         shell: pwsh
         run: |
           New-Item dist -ItemType Directory -Force | Out-Null
-          Compress-Archive publish\* dist\v2rayN-windows-64.zip
+          Compress-Archive publish\* dist\v2rayN-windows-64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
