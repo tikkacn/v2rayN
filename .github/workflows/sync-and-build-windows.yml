@@ -85,9 +85,6 @@ jobs:
           "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
           "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host "AXAML: $($axaml.FullName)"
-          Write-Host "CODE : $($cs.FullName)"
-
       - name: Remove Promotion menu item (XAML) + Fix code-behind references
         shell: pwsh
         run: |
@@ -96,14 +93,15 @@ jobs:
           $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
           $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
-          # ---- 1) 删除 XAML 里的 menuPromotion MenuItem ----
+          # ----------------------------
+          # 1) 删除 XAML 里的 menuPromotion
+          # ----------------------------
           $x = Get-Content $axaml -Raw -Encoding UTF8
 
-          $patternLine = '^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          $x2 = [regex]::Replace($x, $patternLine, '', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $x2 = [regex]::Replace($x, $patternLine, '')
 
           if ($x2 -eq $x) {
-            # 兜底：非整行写法
             $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
             $x2 = [regex]::Replace($x, $patternAny, '')
           }
@@ -115,7 +113,6 @@ jobs:
 
           Set-Content $axaml $x2 -Encoding UTF8
 
-          # Guard：确保 XAML 已无 menuPromotion
           $xCheck = Get-Content $axaml -Raw -Encoding UTF8
           if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
             Write-Error "menuPromotion still exists in XAML after edit."
@@ -124,23 +121,27 @@ jobs:
 
           Write-Host "✅ menuPromotion removed from XAML"
 
-          # ---- 2) 修正 code-behind：删除/注释对 menuPromotion 的引用 ----
+          # --------------------------------------
+          # 2) 删除 code-behind 里对 menuPromotion 的引用
+          #   重点修复：必须用 (?m) 多行模式，否则 ^ 只能匹配文件开头
+          # --------------------------------------
           $c = Get-Content $cs -Raw -Encoding UTF8
 
-          # 常见写法：menuPromotion.Click += ...
-          $c2 = $c -replace '^\s*menuPromotion\.[^\r\n]*\r?\n', ''
-          # 兜底：任何包含 menuPromotion 的单行（避免残留引用导致 CS0103）
-          $c2 = $c2 -replace '^\s*.*\bmenuPromotion\b.*\r?\n', ''
+          # (a) 先删“包含 menuPromotion 的整行”
+          $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
+
+          # (b) 再兜底：有些写法会分多行（比如先换行再 .Click），把紧邻块也删掉
+          #     删除 menuPromotion 开头的 1~6 行连续代码块（足够覆盖绑定/初始化）
+          $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
 
           if ($c2 -ne $c) {
             Set-Content $cs $c2 -Encoding UTF8
             Write-Host "✅ menuPromotion references removed from code-behind"
           } else {
-            # 如果没有引用也没关系（不同版本可能已经不用）
-            Write-Host "ℹ️ No menuPromotion references found in code-behind (ok)"
+            Write-Host "ℹ️ No menuPromotion references removed (may not exist or pattern changed)"
           }
 
-          # 最终 Guard：如果还存在 menuPromotion 标识符，直接失败（防回归/防漏删）
+          # Guard：只要还出现 menuPromotion 这个标识符就失败（防回归）
           $final = Get-Content $cs -Raw -Encoding UTF8
           if ($final -match '\bmenuPromotion\b') {
             Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
@@ -154,7 +155,6 @@ jobs:
           $csproj = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
           if (-not $csproj) { Write-Error "v2rayN.Desktop.csproj not found"; exit 1 }
           "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Using csproj: $($csproj.FullName)"
 
       - name: Restore
         shell: pwsh
