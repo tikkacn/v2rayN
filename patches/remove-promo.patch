@@ -1,0 +1,14 @@
+diff --git a/v2rayN.Desktop/Views/MainWindow.xaml b/v2rayN.Desktop/Views/MainWindow.xaml
+--- a/v2rayN.Desktop/Views/MainWindow.xaml
++++ b/v2rayN.Desktop/Views/MainWindow.xaml
+@@ -1,6 +1,6 @@
+ <Window
+     x:Class="v2rayN.Desktop.Views.MainWindow"
+     xmlns="https://github.com/avaloniaui"
+@@
+                     <MenuItem x:Name="menuReload" Header="{x:Static resx:ResUI.menuReload}" />
+-
+-                    <MenuItem x:Name="menuPromotion" Header="{x:Static resx:ResUI.menuPromotion}" />
+ 
+                     <MenuItem x:Name="menuClose" Header="{x:Static resx:ResUI.menuExit}" />
+                 </Menu>
