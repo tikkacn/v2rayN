@@ -1,15 +1,15 @@
-name: Sync upstream & Build Windows (WPF, no promo)
+name: sync_and_build_windows
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"   # UTC 03:00 (北京时间 11:00)
+    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-build-wpf
+  group: sync-and-build-windows
   cancel-in-progress: true
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout current branch
+      - name: Checkout current repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -42,6 +42,7 @@ jobs:
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
           if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
+          Write-Host "Upstream HEAD is $up"
 
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
@@ -67,47 +68,66 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Apply remove-promo patch
+      # ⭐ 核心：删除“推广/喇叭”入口（按钮本体）
+      - name: Remove Promotion menu item (menuPromotion) from MainWindow.axaml
         shell: pwsh
         run: |
-          if (Test-Path "patches/remove-promo.patch") {
-            git apply --whitespace=nowarn patches/remove-promo.patch
-            Write-Host "Patch applied."
-          } else {
-            Write-Error "Missing patches/remove-promo.patch"
+          $ErrorActionPreference = "Stop"
+
+          $file = "v2rayN.Desktop/Views/MainWindow.axaml"
+          if (!(Test-Path $file)) {
+            Write-Error "Target file not found: $file"
             exit 1
           }
 
-      # 如果未来上游把 MainWindow.xaml 改结构导致 patch 失败
-      # 这里会直接报错并停止，让你第一时间知道需要更新 patch
+          $content = Get-Content $file -Raw -Encoding UTF8
 
-      - name: Locate WPF csproj
-        id: locate
-        shell: pwsh
-        run: |
-          $csproj = Get-ChildItem -Recurse -Filter v2rayN.csproj | Select-Object -First 1
-          if (-not $csproj) { Write-Error "v2rayN.csproj not found"; exit 1 }
-          "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Using csproj: $($csproj.FullName)"
+          # 删除整行：<MenuItem x:Name="menuPromotion" ... />
+          # 兼容不同缩进、属性顺序、换行
+          $patternLine = '^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $new = [regex]::Replace($content, $patternLine, '', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+
+          if ($new -eq $content) {
+            # 兜底：如果不是独立一行（极少数），再做一次更宽松替换
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
+            $new = [regex]::Replace($content, $patternAny, '')
+          }
+
+          if ($new -eq $content) {
+            Write-Error "menuPromotion not removed (pattern not matched). Upstream may have changed the markup."
+            exit 1
+          }
+
+          Set-Content $file $new -Encoding UTF8
+
+          # Guard：确保真的没了
+          $check = Get-Content $file -Raw -Encoding UTF8
+          if ($check -match 'x:Name\s*=\s*"menuPromotion"') {
+            Write-Error "menuPromotion still exists after edit."
+            exit 1
+          }
+
+          Write-Host "✅ menuPromotion removed."
 
       - name: Restore
         shell: pwsh
-        run: dotnet restore "${{ steps.locate.outputs.csproj }}"
+        run: dotnet restore "v2rayN.Desktop/v2rayN.Desktop.csproj"
 
       - name: Publish (win-x64, self-contained)
         shell: pwsh
         run: |
-          dotnet publish "${{ steps.locate.outputs.csproj }}" `
+          dotnet publish "v2rayN.Desktop/v2rayN.Desktop.csproj" `
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
             -o publish
 
-      - name: Zip
+      - name: Zip artifact
         shell: pwsh
         run: |
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           New-Item dist -ItemType Directory -Force | Out-Null
-          Compress-Archive publish\* dist\v2rayN-windows-64.zip -Force
+          Compress-Archive -Path publish\* -DestinationPath dist\v2rayN-windows-64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
