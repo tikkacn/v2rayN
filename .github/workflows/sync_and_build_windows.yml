@@ -1,20 +1,15 @@
-name: sync_and_build_windows (x64, no-ads)
+name: sync_and_build_windows
 
 on:
   workflow_dispatch:
     inputs:
-      force_build:
-        description: "Force build even if no upstream updates"
-        required: false
-        type: boolean
-        default: false
       release_tag:
         description: "If set, upload zip to GitHub Release with this tag (e.g. v7.18.0)"
         required: false
         type: string
         default: ""
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours (UTC)
+    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
 
 permissions:
   contents: write
@@ -25,11 +20,11 @@ concurrency:
 
 jobs:
   sync_and_build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     env:
       OUT_ARCH: "windows-64"
-      OUT_DIR: "${{ github.workspace }}/v2rayN/Release/windows-64"
+      OUT_DIR: "${{ github.workspace }}\\v2rayN\\Release\\windows-64"
 
     steps:
       - name: Checkout repo (with submodules)
@@ -39,148 +34,176 @@ jobs:
           submodules: recursive
 
       - name: Configure git
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add & fetch upstream (2dust/v2rayN)
-        shell: bash
+      - name: Fetch upstream
+        shell: pwsh
         run: |
-          set -euo pipefail
-          git remote add upstream https://github.com/2dust/v2rayN.git 2>/dev/null || true
+          git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
           git fetch upstream --prune
           git remote set-head upstream -a
 
-      - name: Detect upstream default branch (main/master)
-        id: upref
-        shell: bash
-        run: |
-          set -euo pipefail
-          UPREF="$(git symbolic-ref -q refs/remotes/upstream/HEAD || true)"
-          if [ -z "${UPREF}" ]; then
-            echo "Cannot resolve upstream HEAD" >&2
-            exit 1
-          fi
-          UP="${UPREF#refs/remotes/}"
-          echo "up=$UP" >> "$GITHUB_OUTPUT"
-          echo "Upstream HEAD => $UP"
-
       - name: Detect upstream changes
         id: diff
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          UP="${{ steps.upref.outputs.up }}"
-          BEHIND="$(git rev-list --count "HEAD..$UP")"
-          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          echo "Upstream ahead by $BEHIND commits"
+          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
+          $up = $upRef -replace '^refs/remotes/', ''
+          $behind = git rev-list --count "HEAD..$up"
+          "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Upstream ahead by $behind commits"
 
-      - name: Exit if no upstream updates (unless forced)
-        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
-        shell: bash
+      - name: Exit if no upstream updates
+        if: steps.diff.outputs.behind == '0'
+        shell: pwsh
         run: |
-          echo "No upstream updates. Exit."
+          Write-Host "No upstream updates. Exit."
           exit 0
 
-      - name: Merge upstream & push (only if changed)
-        if: steps.diff.outputs.behind != '0'
-        shell: bash
+      - name: Merge upstream & push
+        shell: pwsh
         run: |
-          set -euo pipefail
-          UP="${{ steps.upref.outputs.up }}"
-          git merge --no-edit "$UP"
+          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
+          $up = $upRef -replace '^refs/remotes/', ''
+          git merge --no-edit $up
           git push origin HEAD
 
-      - name: Setup .NET 8
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Remove Promotion menu item (menuPromotion) + cleanup code-behind (no YAML-indent risks)
-        shell: bash
+      - name: Locate MainWindow axaml & code-behind
+        id: locate_mainwindow
+        shell: pwsh
         run: |
-          set -euo pipefail
+          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
+            Select-Object -First 1
+          if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
 
-          # --- locate MainWindow.axaml & MainWindow.axaml.cs robustly ---
-          AXAML=""
-          CS=""
+          $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
+            Select-Object -First 1
+          if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
 
-          if [ -f "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml" ]; then
-            AXAML="v2rayN/v2rayN.Desktop/Views/MainWindow.axaml"
-          fi
-          if [ -f "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs" ]; then
-            CS="v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs"
-          fi
+          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-          if [ -z "$AXAML" ]; then
-            AXAML="$(git ls-files | grep -E '(^|/)v2rayN\.Desktop/Views/MainWindow\.axaml$' | head -n 1 || true)"
-          fi
-          if [ -z "$CS" ]; then
-            CS="$(git ls-files | grep -E '(^|/)v2rayN\.Desktop/Views/MainWindow\.axaml\.cs$' | head -n 1 || true)"
-          fi
+      - name: Remove Promotion menu item (XAML) + Fix code-behind references
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          if [ -z "$AXAML" ] || [ ! -f "$AXAML" ]; then
-            echo "MainWindow.axaml not found" >&2
+          $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
+          $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
+
+          # 1) 删除 XAML 里的 menuPromotion
+          $x = Get-Content $axaml -Raw -Encoding UTF8
+
+          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $x2 = [regex]::Replace($x, $patternLine, '')
+
+          if ($x2 -eq $x) {
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
+            $x2 = [regex]::Replace($x, $patternAny, '')
+          }
+
+          if ($x2 -eq $x) {
+            Write-Error "menuPromotion not removed from XAML (pattern not matched)."
             exit 1
-          fi
-          if [ -z "$CS" ] || [ ! -f "$CS" ]; then
-            echo "MainWindow.axaml.cs not found" >&2
+          }
+
+          Set-Content $axaml $x2 -Encoding UTF8
+
+          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
+          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
+            Write-Error "menuPromotion still exists in XAML after edit."
             exit 1
-          fi
+          }
 
-          echo "AXAML=$AXAML"
-          echo "CS=$CS"
+          Write-Host "✅ menuPromotion removed from XAML"
 
-          # --- write python patcher via base64 (no heredoc indentation pitfalls) ---
-          PY_B64="aW1wb3J0IHJlCmltcG9ydCBzeXMKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgpheGFtbF9wYXRoID0gUGF0aChzeXMuYXJndlsxXSkKY3NfcGF0aCAgID0gUGF0aChzeXMuYXJndlsyXSkKCnggPSBheGFtbF9wYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiLCBlcnJvcnM9Imlnbm9yZSIpCgojIFJlbW92ZSBzZWxmLWNsb3NpbmcgTWVudUl0ZW0geDpOYW1lPSJtZW51UHJvbW90aW9uIgpwYXQxID0gcmUuY29tcGlsZShyJyg/bSleW1x0XSAqPE1lbnVJdGVtXFxiW14+XSpcYng6TmFtZVxzKj1ccyoibWVudVByb21vdGlvbiJbXj5dKi8+W1x0XSAqXHI/XG4/JykKeDIgPSBwYXQxLnN1YigiIiwgeCkKCiMgUmVtb3ZlIG5vbi1zZWxmLWNsb3NpbmcgTWVudUl0ZW0gKGRlZmVuc2l2ZSkKcGF0MiA9IHJlLmNvbXBpbGUocicoP21zKV5bXHQgXSo8TWVudUl0ZW1cYltePl0qXGJ4Ok5hbWVccyo9XHMqIm1lbnVQcm9tb3Rpb24iW14+XSo+Lio/PC9NZW51SXRlbT5bXHQgXSpcHI9XG4/JykKeDIgPSBwYXQyLnN1YigiIiwgeDIpCgppZiByZS5zZWFyY2gociJcYng6TmFtZVxzKj1ccyoibWVudVByb21vdGlvbiJcYiIsIHgyKToKICAgIHJhaXNlIFN5c3RlbUV4aXQoIkVSUk9SOiBtZW51UHJvbW90aW9uIHN0aWxsIGV4aXN0cyBpbiBNYWluV2luZG93LmF4YW1sIGFmdGVyIGNsZWFudXAiKQoKaWYgeDIgPT0geDoKICAgIHJhaXNlIFN5c3RlbUV4aXQoIkVSUk9SOiBtZW51UHJvbW90aW9uIG5vdCByZW1vdmVkIGZyb20gTWFpbldpbmRvdy5heGFtbCAobWFya3VwIGNoYW5nZWQ/KSIpCgpheGFtbF9wYXRoLndyaXRlX3RleHQoeDIsIGVuY29kaW5nPSJ1dGYtOCIsIG5ld2xpbmU9IlxuIikKcHJpbnQoIk9LOiBtZW51UHJvbW90aW9uIHJlbW92ZWQgZnJvbSBYQU1MIikKCmMgPSBjc19wYXRoLnJlYWRfdGV4dChlbmNvZGluZz0idXRmLTgiLCBlcnJvcnM9Imlnbm9yZSIpCgojIDEpIHJlbW92ZSBhbnkgbGluZSB0aGF0IHJlZmVyZW5jZXMgbWVudVByb21vdGlvbgpjMiA9IHJlLnN1YihyIig/bSleW15cbl0qXGJtZW51UHJvbW90aW9uXGJbXlxuXSpcbiIsICIiLCBjKQoKIyAyKSByZW1vdmUgTWVudVByb21vdGlvbl9DbGljayBtZXRob2QgaWYgZXhpc3RzC2MyID0gcmUuc3ViKAogICAgcic(?ms)^\\s*(?:private|public|protected|internal)?\\s*(?:async\\s+)?void\\s+MenuPromotion_Click\\s*\\([^)]*\\)\\s*\\{.*?\\}\\s*\\n?',CiAgICAiIiwKICAgIGMyCikKCmlmIHJlLnNlYXJjaChyIlxi bWVudVByb21vdGlvblxiIiwgYzIsIGZsYWdzPXJlLlgtcmUpOgogICAgcGFzcwoKIyBHdWFyZDogbm8gcmVtYWluaW5nIG1lbnVQcm9tb3Rpb24gaWRlbnRpZmllcgpzaWZlciA9IHJlLnNlYXJjaChyIlxi bWVudVByb21vdGlvblxiIiwgYzIpCmlmIHNpZmVyOgogICAgcmFpc2UgU3lzdGVtRXhpdCgiRVJST1I6IG1lbnVQcm9tb3Rpb24gc3RpbGwgcmVmZXJlbmNlZCBpbiBNYWluV2luZG93LmF4YW1sLmNzIGFmdGVyIGNsZWFudXAiKQoKY3NfcGF0aC53cml0ZV90ZXh0KGMyLCBlbmNvZGluZz0idXRmLTgiLCBuZXdsaW5lPSJcbiIpCnByaW50KCJPSzogY29kZS1iZWhpbmQgY2xlYW5lZCIpCg=="
+          # 2) 删除 code-behind 里对 menuPromotion 的引用
+          $c = Get-Content $cs -Raw -Encoding UTF8
+          $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
+          $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
 
-          echo "$PY_B64" | base64 -d > /tmp/remove_promo.py
-          python3 /tmp/remove_promo.py "$AXAML" "$CS"
+          if ($c2 -ne $c) {
+            Set-Content $cs $c2 -Encoding UTF8
+            Write-Host "✅ menuPromotion references removed from code-behind"
+          } else {
+            Write-Host "ℹ️ No menuPromotion references removed (may not exist or pattern changed)"
+          }
 
-      - name: Prepare output dir (match upstream layout)
-        shell: bash
+          $final = Get-Content $cs -Raw -Encoding UTF8
+          if ($final -match '\bmenuPromotion\b') {
+            Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
+            exit 1
+          }
+
+      # -----------------------------
+      # ✅ 关键：按“上游发布包”方式输出目录
+      # -----------------------------
+      - name: Prepare output dir (match upstream)
+        shell: pwsh
         run: |
-          set -euo pipefail
-          rm -rf "${OUT_DIR}"
-          mkdir -p "${OUT_DIR}"
+          if (Test-Path "${{ env.OUT_DIR }}") { Remove-Item "${{ env.OUT_DIR }}" -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "${{ env.OUT_DIR }}" | Out-Null
 
-      - name: Publish v2rayN Desktop (win-x64, self-contained) into upstream release folder
-        shell: bash
+      - name: Publish v2rayN Desktop (win-x64, self-contained) into release folder
+        shell: pwsh
         run: |
-          set -euo pipefail
           cd v2rayN
-          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
-            -c Release -r win-x64 \
-            -p:SelfContained=true -p:EnableWindowsTargeting=true \
-            -o "${OUT_DIR}"
+          dotnet publish .\v2rayN.Desktop\v2rayN.Desktop.csproj `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -p:EnableWindowsTargeting=true `
+            -o "${{ env.OUT_DIR }}"
 
       - name: Publish AmazTool (win-x64, self-contained, trimmed) into same folder
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
           cd v2rayN
-          dotnet publish ./AmazTool/AmazTool.csproj \
-            -c Release -r win-x64 \
-            -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
-            -o "${OUT_DIR}"
+          dotnet publish .\AmazTool\AmazTool.csproj `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -p:EnableWindowsTargeting=true `
+            -p:PublishTrimmed=true `
+            -o "${{ env.OUT_DIR }}"
 
       - name: Upload raw publish folder (for debugging)
         uses: actions/upload-artifact@v4
         with:
           name: v2rayN-windows-64-raw
-          path: |
-            ${{ github.workspace }}/v2rayN/Release/windows-64
+          path: v2rayN/Release/windows-64
 
+      # ✅ 使用上游的打包脚本，保证 zip 内结构和官方一致（含 bin 等）
       - name: Package release zip archive (same style as upstream) + rename (noads)
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cd "${GITHUB_WORKSPACE}"
-          chmod +x package-release-zip.sh
-          ./package-release-zip.sh "${OUT_ARCH}" "${OUT_DIR}"
-          mv "v2rayN-${OUT_ARCH}.zip" "v2rayN-${OUT_ARCH}-noads.zip"
+          cd "${{ github.workspace }}"
+          if (-not (Test-Path ".\package-release-zip.sh")) {
+            Write-Error "package-release-zip.sh not found at repo root"
+            exit 1
+          }
+
+          # Git Bash 来执行 sh（windows runner 自带）
+          bash -lc "chmod +x package-release-zip.sh && ./package-release-zip.sh '${{ env.OUT_ARCH }}' '${{ env.OUT_DIR }}'"
+
+          if (-not (Test-Path "v2rayN-${{ env.OUT_ARCH }}.zip")) {
+            Write-Error "Expected zip not generated: v2rayN-${{ env.OUT_ARCH }}.zip"
+            exit 1
+          }
+
+          Move-Item "v2rayN-${{ env.OUT_ARCH }}.zip" "v2rayN-${{ env.OUT_ARCH }}-noads.zip" -Force
 
       - name: Upload packaged zip artifact
         uses: actions/upload-artifact@v4
@@ -194,10 +217,10 @@ jobs:
         with:
           file: v2rayN-windows-64-noads.zip
           tag: ${{ inputs.release_tag }}
+          file_glob: false
           prerelease: false
           overwrite: true
           body: |
-            **v2rayN 去广告版**（仅 win-x64）
-            - 版本号与上游一致
-            - 已移除 UI 中 “推广 / menuPromotion” 菜单项及其代码引用
-            - 打包结构保持与上游一致（使用 package-release-zip.sh）
+            **v2rayN 去广告版（win-x64）**
+            - 版本号与上游一致（仅去除 UI “推广 / menuPromotion”）
+            - 打包结构对齐上游（使用 package-release-zip.sh）
