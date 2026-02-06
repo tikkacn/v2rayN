@@ -1,0 +1,133 @@
+name: Sync upstream & Build Windows (WPF)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"   # UTC 03:00（北京时间 11:00）
+
+permissions:
+  contents: write
+
+jobs:
+  sync_and_build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/2dust/v2rayN.git || true
+          git fetch upstream --prune
+
+      - name: Detect upstream changes
+        id: diff
+        shell: bash
+        run: |
+          CUR="${GITHUB_REF_NAME}"
+          if git show-ref --verify --quiet refs/remotes/upstream/master; then
+            UP="upstream/master"
+          else
+            UP="upstream/main"
+          fi
+
+          BEHIND=$(git rev-list --count HEAD..$UP)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "No upstream updates"
+          else
+            echo "Upstream ahead by $BEHIND commits"
+          fi
+
+      - name: Exit if no upstream updates
+        if: steps.diff.outputs.behind == '0'
+        run: |
+          echo "✅ No updates, stop workflow"
+          exit 0
+
+      - name: Merge upstream & push
+        run: |
+          if git show-ref --verify --quiet refs/remotes/upstream/master; then
+            UP="upstream/master"
+          else
+            UP="upstream/main"
+          fi
+
+          git merge --no-edit "$UP"
+          git push origin HEAD
+
+      # ===== 到这里为止：同步完成 =====
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Remove promote entry (auto)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Remove-PromoteFromXaml([string]$path) {
+            $s = Get-Content -Raw -Encoding UTF8 $path
+            $orig = $s
+
+            $s = [regex]::Replace($s, '(?s)<Button\b[^>]*\bPromoteCommand\b[^>]*>.*?</Button>', '')
+            $s = [regex]::Replace($s, '(?s)<MenuItem\b[^>]*\bPromoteCommand\b[^>]*>.*?</MenuItem>', '')
+            $s = [regex]::Replace($s, '(?s)<Button\b[^>]*>.*?推广.*?</Button>', '')
+            $s = [regex]::Replace($s, '(?s)<MenuItem\b[^>]*>.*?推广.*?</MenuItem>', '')
+
+            if ($s -ne $orig) {
+              Set-Content -Path $path -Value $s -Encoding UTF8
+              return $true
+            }
+            return $false
+          }
+
+          Get-ChildItem -Recurse -File -Include *.xaml |
+            Where-Object { $_.FullName -match '\\v2rayN\\' } |
+            ForEach-Object {
+              if (Remove-PromoteFromXaml $_.FullName) {
+                Write-Host "removed promote in $($_.FullName)"
+              }
+            }
+
+      - name: Locate WPF csproj
+        id: locate
+        shell: pwsh
+        run: |
+          $csproj = Get-ChildItem -Recurse -Filter v2rayN.csproj | Select-Object -First 1
+          if (-not $csproj) { Write-Host "csproj not found"; exit 1 }
+          "csproj=$($csproj.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Restore
+        run: dotnet restore "${{ steps.locate.outputs.csproj }}"
+
+      - name: Publish (win-x64, self-contained)
+        run: |
+          dotnet publish "${{ steps.locate.outputs.csproj }}" `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -o publish
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          New-Item dist -ItemType Directory -Force | Out-Null
+          Compress-Archive publish\* dist\v2rayN-windows-64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-windows-64.zip
+          path: dist/v2rayN-windows-64.zip
