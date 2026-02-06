@@ -1,183 +1,254 @@
-name: sync_and_build_windows
+name: sync_build_release_windows
 
 on:
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Build even if upstream has no new commits"
+        required: false
+        default: false
+        type: boolean
   schedule:
-    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
+    - cron: "0 */6 * * *" # every 6 hours (UTC)
 
 permissions:
   contents: write
 
 concurrency:
-  group: sync-and-build-windows
+  group: sync-build-release-windows
   cancel-in-progress: true
 
+env:
+  OutputArch: "windows-64"
+  OutputPath64: "${{ github.workspace }}/v2rayN/Release/windows-64"
+
 jobs:
-  sync_and_build:
-    runs-on: windows-latest
+  sync_build_release:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo (with submodules)
+      - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Configure git
-        shell: pwsh
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch upstream
-        shell: pwsh
+      - name: Add & fetch upstream
+        shell: bash
         run: |
-          git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
+          git remote add upstream https://github.com/2dust/v2rayN.git 2>/dev/null || true
           git fetch upstream --prune
           git remote set-head upstream -a
 
       - name: Detect upstream changes
         id: diff
-        shell: pwsh
+        shell: bash
         run: |
-          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
-          $up = $upRef -replace '^refs/remotes/', ''
-          $behind = git rev-list --count "HEAD..$up"
-          "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Upstream ahead by $behind commits"
+          UP_REF="$(git symbolic-ref -q refs/remotes/upstream/HEAD)"
+          if [ -z "$UP_REF" ]; then
+            echo "Cannot resolve upstream HEAD"
+            exit 1
+          fi
+          UP="${UP_REF#refs/remotes/}"
+          BEHIND="$(git rev-list --count HEAD..$UP)"
+          echo "up=$UP" >> "$GITHUB_OUTPUT"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream ahead by $BEHIND commits"
 
-      - name: Exit if no upstream updates
-        if: steps.diff.outputs.behind == '0'
-        shell: pwsh
+      - name: Exit if no upstream updates (unless forced)
+        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
+        shell: bash
         run: |
-          Write-Host "No upstream updates. Exit."
+          echo "No upstream updates. Exit."
           exit 0
 
       - name: Merge upstream & push
-        shell: pwsh
+        shell: bash
         run: |
-          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
-          $up = $upRef -replace '^refs/remotes/', ''
-          git merge --no-edit $up
+          git merge --no-edit "${{ steps.diff.outputs.up }}"
           git push origin HEAD
 
-      - name: Setup .NET
+      - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Locate MainWindow axaml & code-behind
-        id: locate_mainwindow
-        shell: pwsh
+      # --- 读取上游版本号：tag 必须与上游一致 ---
+      - name: Detect upstream version
+        id: ver
+        shell: bash
         run: |
-          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
-            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
-            Select-Object -First 1
-          if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
+          set -euo pipefail
 
-          $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
-            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
-            Select-Object -First 1
-          if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
+          python3 - <<'PY'
+import re, pathlib, sys
 
-          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+# 依次尝试这些文件里找 <Version>...</Version>
+candidates = [
+    pathlib.Path("v2rayN/Directory.Build.props"),
+    pathlib.Path("v2rayN/Directory.Build.targets"),
+    pathlib.Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),
+    pathlib.Path("v2rayN/ServiceLib/ServiceLib.csproj"),
+]
 
-      - name: Remove Promotion menu item (XAML) + Fix code-behind references
-        shell: pwsh
+version = None
+for p in candidates:
+    if not p.exists():
+        continue
+    s = p.read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
+    if m:
+        version = m.group(1).strip()
+        break
+
+if not version:
+    raise SystemExit("Cannot find <Version> in common project/props files.")
+
+# 去掉可能的前缀 v
+version = version.lstrip("v").strip()
+print(version)
+PY
+
+          VER="$(python3 -c 'import sys; print(sys.stdin.read().strip())' <<< "")" || true
+          # 上面那行不需要，防止误会；真正版本从上一段 python 输出里读：
+          VER="$(python3 - <<'PY'
+import re, pathlib
+candidates=[
+  pathlib.Path("v2rayN/Directory.Build.props"),
+  pathlib.Path("v2rayN/Directory.Build.targets"),
+  pathlib.Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),
+  pathlib.Path("v2rayN/ServiceLib/ServiceLib.csproj"),
+]
+ver=None
+for p in candidates:
+  if not p.exists(): continue
+  s=p.read_text(encoding="utf-8",errors="ignore")
+  m=re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
+  if m:
+    ver=m.group(1).strip()
+    break
+if not ver: raise SystemExit(1)
+print(ver.lstrip("v").strip())
+PY
+          )"
+
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
+          echo "info=$VER 去广告版" >> "$GITHUB_OUTPUT"
+
+          echo "Detected version: $VER"
+          echo "Release tag will be: v$VER"
+          echo "InformationalVersion: $VER 去广告版"
+
+      # --- Remove Promotion menu item (edit source directly) ---
+      - name: Remove Promotion menu item (menuPromotion) from MainWindow.axaml + code-behind
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
-          $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
+          AXAML="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml" | head -n 1 || true)"
+          CS="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml.cs" | head -n 1 || true)"
 
-          # ----------------------------
-          # 1) 删除 XAML 里的 menuPromotion
-          # ----------------------------
-          $x = Get-Content $axaml -Raw -Encoding UTF8
-
-          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          $x2 = [regex]::Replace($x, $patternLine, '')
-
-          if ($x2 -eq $x) {
-            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
-            $x2 = [regex]::Replace($x, $patternAny, '')
-          }
-
-          if ($x2 -eq $x) {
-            Write-Error "menuPromotion not removed from XAML (pattern not matched)."
+          if [ -z "$AXAML" ] || [ ! -f "$AXAML" ]; then
+            echo "MainWindow.axaml not found"
             exit 1
-          }
-
-          Set-Content $axaml $x2 -Encoding UTF8
-
-          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
-          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
-            Write-Error "menuPromotion still exists in XAML after edit."
+          fi
+          if [ -z "$CS" ] || [ ! -f "$CS" ]; then
+            echo "MainWindow.axaml.cs not found"
             exit 1
-          }
+          fi
 
-          Write-Host "✅ menuPromotion removed from XAML"
+          echo "AXAML=$AXAML"
+          echo "CS=$CS"
 
-          # --------------------------------------
-          # 2) 删除 code-behind 里对 menuPromotion 的引用
-          #   重点修复：必须用 (?m) 多行模式，否则 ^ 只能匹配文件开头
-          # --------------------------------------
-          $c = Get-Content $cs -Raw -Encoding UTF8
+          python3 - <<'PY' "$AXAML"
+import re, pathlib, sys
+axaml = pathlib.Path(sys.argv[1])
+s = axaml.read_text(encoding="utf-8", errors="ignore")
+s2 = re.sub(r'(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?', '', s)
+if s2 == s:
+    s2 = re.sub(r'\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '', s)
+if s2 == s:
+    raise SystemExit("menuPromotion not removed from XAML (pattern not matched)")
+if re.search(r'x:Name\s*=\s*"menuPromotion"', s2):
+    raise SystemExit("menuPromotion still exists in XAML after edit")
+axaml.write_text(s2, encoding="utf-8")
+print("OK: menuPromotion removed from XAML")
+PY
 
-          # (a) 先删“包含 menuPromotion 的整行”
-          $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
+          python3 - <<'PY' "$CS"
+import re, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text(encoding="utf-8", errors="ignore")
+s2 = re.sub(r'(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '', s)
+s2 = re.sub(r'(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '', s2)
+p.write_text(s2, encoding="utf-8")
+if re.search(r'\bmenuPromotion\b', s2):
+    raise SystemExit("menuPromotion still referenced in code-behind after cleanup")
+print("OK: menuPromotion references removed from code-behind")
+PY
 
-          # (b) 再兜底：有些写法会分多行（比如先换行再 .Click），把紧邻块也删掉
-          #     删除 menuPromotion 开头的 1~6 行连续代码块（足够覆盖绑定/初始化）
-          $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
-
-          if ($c2 -ne $c) {
-            Set-Content $cs $c2 -Encoding UTF8
-            Write-Host "✅ menuPromotion references removed from code-behind"
-          } else {
-            Write-Host "ℹ️ No menuPromotion references removed (may not exist or pattern changed)"
-          }
-
-          # Guard：只要还出现 menuPromotion 这个标识符就失败（防回归）
-          $final = Get-Content $cs -Raw -Encoding UTF8
-          if ($final -match '\bmenuPromotion\b') {
-            Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
-            exit 1
-          }
-
-      - name: Locate v2rayN.Desktop.csproj
-        id: locate_csproj
-        shell: pwsh
+      - name: Build (Windows x64 desktop only)
+        shell: bash
         run: |
-          $csproj = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
-          if (-not $csproj) { Write-Error "v2rayN.Desktop.csproj not found"; exit 1 }
-          "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.ver }}"
+          INFO="${{ steps.ver.outputs.info }}"
 
-      - name: Restore
-        shell: pwsh
-        run: dotnet restore "${{ steps.locate_csproj.outputs.csproj }}"
+          cd v2rayN
 
-      - name: Publish (win-x64, self-contained)
-        shell: pwsh
-        run: |
-          dotnet publish "${{ steps.locate_csproj.outputs.csproj }}" `
-            -c Release `
-            -r win-x64 `
-            -p:SelfContained=true `
-            -o publish
+          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
+            -c Release -r win-x64 \
+            -p:SelfContained=true -p:EnableWindowsTargeting=true \
+            -p:Version="$VER" -p:InformationalVersion="$INFO" \
+            -o "$OutputPath64"
 
-      - name: Zip artifact
-        shell: pwsh
-        run: |
-          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
-          New-Item dist -ItemType Directory -Force | Out-Null
-          Compress-Archive -Path publish\* -DestinationPath dist\v2rayN-windows-64.zip -Force
+          dotnet publish ./AmazTool/AmazTool.csproj \
+            -c Release -r win-x64 \
+            -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
+            -p:Version="$VER" -p:InformationalVersion="$INFO" \
+            -o "$OutputPath64"
 
-      - name: Upload artifact
+      - name: Upload build artifacts (directory)
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayN-windows-64.zip
-          path: dist/v2rayN-windows-64.zip
+          name: v2rayN-windows-64-desktop-dir
+          path: |
+            ${{ github.workspace }}/v2rayN/Release/windows-64
+
+      - name: Package release zip archive (same as upstream)
+        shell: bash
+        run: |
+          chmod 755 package-release-zip.sh
+          ./package-release-zip.sh "$OutputArch" "$OutputPath64"
+          mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-desktop-noads.zip"
+
+      # --- tag 与上游一致：vX.Y.Z （强制更新同名 tag 指向最新 commit） ---
+      - name: Create/Update tag to match upstream version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+
+          # 强制移动同名 tag 到当前提交（你要求“和上游一致”就必须这样做）
+          git tag -f "$TAG"
+          git push -f origin "$TAG"
+
+      - name: Upload zip to GitHub Release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          file: ${{ github.workspace }}/v2rayN-${{ env.OutputArch }}-desktop-noads.zip
+          tag: ${{ steps.ver.outputs.tag }}
+          file_glob: false
+          prerelease: false
+          overwrite: true
+          body: |
+            版本号与上游一致：${{ steps.ver.outputs.tag }}
+            标识：去广告版（已移除 menuPromotion 入口）
+            构建：Windows x64 Desktop（Avalonia）
