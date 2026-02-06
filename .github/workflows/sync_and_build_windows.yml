@@ -1,4 +1,4 @@
-name: sync_and_build_windows (no-promo, x64)
+name: sync_and_build_windows (x64, no-ads)
 
 on:
   workflow_dispatch:
@@ -6,13 +6,13 @@ on:
       force_build:
         description: "Force build even if no upstream updates"
         required: false
-        default: false
         type: boolean
+        default: false
       release_tag:
         description: "If set, upload zip to GitHub Release with this tag (e.g. v7.18.0)"
         required: false
-        default: ""
         type: string
+        default: ""
   schedule:
     - cron: "0 */6 * * *" # every 6 hours (UTC)
 
@@ -23,13 +23,13 @@ concurrency:
   group: sync-and-build-windows
   cancel-in-progress: true
 
-env:
-  OUTPUT_ARCH: "windows-64"
-  OUTPUT_PATH64: "${{ github.workspace }}/v2rayN/Release/windows-64"
-
 jobs:
   sync_and_build:
     runs-on: ubuntu-latest
+
+    env:
+      OUT_ARCH: "windows-64"
+      OUT_DIR: "${{ github.workspace }}/v2rayN/Release/windows-64"
 
     steps:
       - name: Checkout repo (with submodules)
@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Add & fetch upstream (2dust/v2rayN)
@@ -53,28 +53,33 @@ jobs:
           git fetch upstream --prune
           git remote set-head upstream -a
 
-      - name: Detect upstream default branch & changes
+      - name: Detect upstream default branch (main/master)
+        id: upref
+        shell: bash
+        run: |
+          set -euo pipefail
+          UPREF="$(git symbolic-ref -q refs/remotes/upstream/HEAD || true)"
+          if [ -z "${UPREF}" ]; then
+            echo "Cannot resolve upstream HEAD"; exit 1
+          fi
+          UP="${UPREF#refs/remotes/}"
+          echo "up=$UP" >> "$GITHUB_OUTPUT"
+          echo "Upstream HEAD => $UP"
+
+      - name: Detect upstream changes
         id: diff
         shell: bash
         run: |
           set -euo pipefail
-          upRef="$(git symbolic-ref -q refs/remotes/upstream/HEAD || true)"
-          if [ -z "$upRef" ]; then
-            echo "Cannot resolve upstream HEAD" >&2
-            exit 1
-          fi
-          up="${upRef#refs/remotes/}"   # e.g. upstream/master or upstream/main
-          behind="$(git rev-list --count "HEAD..$up")"
-          echo "up=$up" >> "$GITHUB_OUTPUT"
-          echo "behind=$behind" >> "$GITHUB_OUTPUT"
-          echo "Upstream branch: $up"
-          echo "Upstream ahead by $behind commits"
+          UP="${{ steps.upref.outputs.up }}"
+          BEHIND="$(git rev-list --count "HEAD..$UP")"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream ahead by $BEHIND commits"
 
       - name: Exit if no upstream updates (unless forced)
         if: steps.diff.outputs.behind == '0' && inputs.force_build != true
         shell: bash
         run: |
-          set -euo pipefail
           echo "No upstream updates. Exit."
           exit 0
 
@@ -83,7 +88,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git merge --no-edit "${{ steps.diff.outputs.up }}"
+          UP="${{ steps.upref.outputs.up }}"
+          git merge --no-edit "$UP"
           git push origin HEAD
 
       - name: Setup .NET 8
@@ -91,20 +97,36 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # -------- remove Promotion (menuPromotion) robustly: XAML + code-behind --------
-      - name: Remove Promotion menu item (menuPromotion) from MainWindow.axaml + code-behind
+      - name: Remove Promotion menu item (menuPromotion) + cleanup code-behind
         shell: bash
         run: |
           set -euo pipefail
 
-          AXAML="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml" | head -n 1 || true)"
-          CS="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml.cs" | head -n 1 || true)"
+          # --- locate MainWindow.axaml & MainWindow.axaml.cs robustly ---
+          AXAML=""
+          CS=""
 
+          # Prefer known path pattern in this repo
+          if [ -f "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml" ]; then
+            AXAML="v2rayN/v2rayN.Desktop/Views/MainWindow.axaml"
+          fi
+          if [ -f "v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs" ]; then
+            CS="v2rayN/v2rayN.Desktop/Views/MainWindow.axaml.cs"
+          fi
+
+          # Fallback: search tracked files
           if [ -z "$AXAML" ]; then
+            AXAML="$(git ls-files | grep -E '(^|/)v2rayN\.Desktop/Views/MainWindow\.axaml$' | head -n 1 || true)"
+          fi
+          if [ -z "$CS" ]; then
+            CS="$(git ls-files | grep -E '(^|/)v2rayN\.Desktop/Views/MainWindow\.axaml\.cs$' | head -n 1 || true)"
+          fi
+
+          if [ -z "$AXAML" ] || [ ! -f "$AXAML" ]; then
             echo "MainWindow.axaml not found" >&2
             exit 1
           fi
-          if [ -z "$CS" ]; then
+          if [ -z "$CS" ] || [ ! -f "$CS" ]; then
             echo "MainWindow.axaml.cs not found" >&2
             exit 1
           fi
@@ -112,16 +134,18 @@ jobs:
           echo "AXAML=$AXAML"
           echo "CS=$CS"
 
-          python3 - <<'PY'
-import re, pathlib, sys
+          # --- write a small python patcher (avoid YAML heredoc pitfalls) ---
+          cat > /tmp/remove_promo.py <<'PY'
+import re
+import sys
+from pathlib import Path
 
-axaml_path = pathlib.Path(sys.argv[1])
-cs_path    = pathlib.Path(sys.argv[2])
+axaml_path = Path(sys.argv[1])
+cs_path    = Path(sys.argv[2])
 
-# ---------- XAML cleanup ----------
 x = axaml_path.read_text(encoding="utf-8", errors="ignore")
 
-# Remove a self-closing MenuItem with x:Name="menuPromotion"
+# Remove self-closing MenuItem x:Name="menuPromotion"
 pat1 = re.compile(r'(?m)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>[ \t]*\r?\n?')
 x2 = pat1.sub("", x)
 
@@ -129,58 +153,65 @@ x2 = pat1.sub("", x)
 pat2 = re.compile(r'(?ms)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>[ \t]*\r?\n?')
 x2 = pat2.sub("", x2)
 
-# Final guard for XAML: must not contain menuPromotion
+if x2 == x:
+    raise SystemExit("ERROR: menuPromotion not removed from MainWindow.axaml (markup changed?)")
+
+# Guard: must be gone
 if re.search(r'\bx:Name\s*=\s*"menuPromotion"\b', x2):
     raise SystemExit("ERROR: menuPromotion still exists in MainWindow.axaml after cleanup")
-
-if x2 == x:
-    # If upstream changed the exact markup and we failed to match, we fail loudly
-    raise SystemExit("ERROR: XAML pattern not matched; menuPromotion not removed (upstream markup changed)")
 
 axaml_path.write_text(x2, encoding="utf-8", newline="\n")
 print("OK: menuPromotion removed from XAML")
 
-# ---------- code-behind cleanup ----------
 c = cs_path.read_text(encoding="utf-8", errors="ignore")
 
-# Remove any lines referencing menuPromotion (event hookups, etc.)
-c2 = re.sub(r'(?m)^[ \t]*.*\bmenuPromotion\b.*\r?\n', "", c)
+# 1) remove any whole line that references menuPromotion
+c2 = re.sub(r'(?m)^[^\n]*\bmenuPromotion\b[^\n]*\n', "", c)
 
-# Remove MenuPromotion_Click method if present (common pattern)
-# Covers: private/ public/ protected/ internal, async optional, return void/Task
+# 2) remove MenuPromotion_Click method if exists (common patterns)
+#    matches: void MenuPromotion_Click(...) { ... }
 c2 = re.sub(
-    r'(?ms)^[ \t]*(?:private|public|protected|internal)?[ \t]*(?:async[ \t]+)?(?:void|Task)[ \t]+MenuPromotion_Click\s*\([^)]*\)\s*\{.*?\}\s*\r?\n?',
+    r'(?ms)^\s*(?:private|public|protected|internal)?\s*(?:async\s+)?void\s+MenuPromotion_Click\s*\([^)]*\)\s*\{.*?\}\s*\n?',
     "",
     c2
 )
 
-cs_path.write_text(c2, encoding="utf-8", newline="\n")
-
-final = cs_path.read_text(encoding="utf-8", errors="ignore")
-if re.search(r'\bmenuPromotion\b', final):
+# 3) guard: no remaining identifier
+if re.search(r'\bmenuPromotion\b', c2):
     raise SystemExit("ERROR: menuPromotion still referenced in MainWindow.axaml.cs after cleanup")
 
+cs_path.write_text(c2, encoding="utf-8", newline="\n")
 print("OK: code-behind cleaned")
-PY "$AXAML" "$CS"
+PY
 
-      - name: Build (publish) win-x64 into upstream release folder layout
+          python3 /tmp/remove_promo.py "$AXAML" "$CS"
+
+      - name: Prepare output dir (match upstream layout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
+
+      - name: Publish v2rayN Desktop (win-x64, self-contained) into upstream release folder
         shell: bash
         run: |
           set -euo pipefail
           cd v2rayN
-
-          rm -rf "./Release/windows-64" || true
-          mkdir -p "./Release/windows-64"
-
           dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true -p:EnableWindowsTargeting=true \
-            -o "${OUTPUT_PATH64}"
+            -o "${OUT_DIR}"
 
+      - name: Publish AmazTool (win-x64, self-contained, trimmed) into same folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd v2rayN
           dotnet publish ./AmazTool/AmazTool.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
-            -o "${OUTPUT_PATH64}"
+            -o "${OUT_DIR}"
 
       - name: Upload raw publish folder (for debugging)
         uses: actions/upload-artifact@v4
@@ -189,39 +220,33 @@ PY "$AXAML" "$CS"
           path: |
             ${{ github.workspace }}/v2rayN/Release/windows-64
 
-      # -------- package like upstream: generate zip with bin folder, etc. --------
-      - name: Package release zip archive (same style as upstream) + add "no-promo" suffix
+      - name: Package release zip archive (same style as upstream) + rename (noads)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ github.workspace }}"
-
-          chmod 755 package-release-zip.sh
-          ./package-release-zip.sh "${OUTPUT_ARCH}" "${OUTPUT_PATH64}"
-
-          # upstream creates: v2rayN-windows-64.zip
-          # rename to: v2rayN-windows-64-no-promo.zip
-          if [ -f "v2rayN-${OUTPUT_ARCH}.zip" ]; then
-            mv "v2rayN-${OUTPUT_ARCH}.zip" "v2rayN-${OUTPUT_ARCH}-no-promo.zip"
-          else
-            echo "ERROR: expected zip not found: v2rayN-${OUTPUT_ARCH}.zip" >&2
-            ls -la
-            exit 1
-          fi
+          cd "${GITHUB_WORKSPACE}"
+          chmod +x package-release-zip.sh
+          ./package-release-zip.sh "${OUT_ARCH}" "${OUT_DIR}"
+          # upstream output: v2rayN-windows-64.zip
+          mv "v2rayN-${OUT_ARCH}.zip" "v2rayN-${OUT_ARCH}-noads.zip"
 
       - name: Upload packaged zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayN-windows-64-no-promo.zip
-          path: |
-            ${{ github.workspace }}/v2rayN-windows-64-no-promo.zip
+          name: v2rayN-windows-64-noads.zip
+          path: v2rayN-windows-64-noads.zip
 
       - name: Upload zip to GitHub Release (optional)
         if: inputs.release_tag != ''
         uses: svenstaro/upload-release-action@v2
         with:
-          file: ${{ github.workspace }}/v2rayN-windows-64-no-promo.zip
+          file: v2rayN-windows-64-noads.zip
           tag: ${{ inputs.release_tag }}
+          file_glob: false
+          prerelease: false
           overwrite: true
-          prerelease: true
-          release_name: "${{ inputs.release_tag }} 去广告版"
+          body: |
+            **v2rayN 去广告版**（仅 win-x64）
+            - 版本号与上游一致
+            - 已移除 UI 中 “推广 / menuPromotion” 菜单项及其代码引用
+            - 打包结构保持与上游一致（使用 package-release-zip.sh）
