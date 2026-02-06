@@ -23,7 +23,7 @@ env:
   OutputPath64: "${{ github.workspace }}/v2rayN/Release/windows-64"
 
 jobs:
-  sync_build_release:
+  sync_and_build:
     runs-on: ubuntu-latest
 
     steps:
@@ -50,6 +50,7 @@ jobs:
         id: diff
         shell: bash
         run: |
+          set -euo pipefail
           UP_REF="$(git symbolic-ref -q refs/remotes/upstream/HEAD)"
           if [ -z "$UP_REF" ]; then
             echo "Cannot resolve upstream HEAD"
@@ -71,6 +72,7 @@ jobs:
       - name: Merge upstream & push
         shell: bash
         run: |
+          set -euo pipefail
           git merge --no-edit "${{ steps.diff.outputs.up }}"
           git push origin HEAD
 
@@ -79,63 +81,33 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # --- 读取上游版本号：tag 必须与上游一致 ---
+      # 读取上游版本号：Release tag 必须与上游一致（vX.Y.Z）
       - name: Detect upstream version
         id: ver
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-import re, pathlib, sys
-
-# 依次尝试这些文件里找 <Version>...</Version>
-candidates = [
-    pathlib.Path("v2rayN/Directory.Build.props"),
-    pathlib.Path("v2rayN/Directory.Build.targets"),
-    pathlib.Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),
-    pathlib.Path("v2rayN/ServiceLib/ServiceLib.csproj"),
-]
-
-version = None
-for p in candidates:
-    if not p.exists():
-        continue
-    s = p.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
-    if m:
-        version = m.group(1).strip()
-        break
-
-if not version:
-    raise SystemExit("Cannot find <Version> in common project/props files.")
-
-# 去掉可能的前缀 v
-version = version.lstrip("v").strip()
-print(version)
-PY
-
-          VER="$(python3 -c 'import sys; print(sys.stdin.read().strip())' <<< "")" || true
-          # 上面那行不需要，防止误会；真正版本从上一段 python 输出里读：
-          VER="$(python3 - <<'PY'
-import re, pathlib
-candidates=[
+          VER="$(
+            python3 -c 'import re, pathlib
+cands=[
   pathlib.Path("v2rayN/Directory.Build.props"),
   pathlib.Path("v2rayN/Directory.Build.targets"),
   pathlib.Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),
   pathlib.Path("v2rayN/ServiceLib/ServiceLib.csproj"),
 ]
 ver=None
-for p in candidates:
-  if not p.exists(): continue
-  s=p.read_text(encoding="utf-8",errors="ignore")
+for p in cands:
+  if not p.exists():
+    continue
+  s=p.read_text(encoding="utf-8", errors="ignore")
   m=re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
   if m:
     ver=m.group(1).strip()
     break
-if not ver: raise SystemExit(1)
-print(ver.lstrip("v").strip())
-PY
+if not ver:
+  raise SystemExit("Cannot find <Version> in props/csproj")
+print(ver.lstrip("v").strip())'
           )"
 
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
@@ -143,10 +115,10 @@ PY
           echo "info=$VER 去广告版" >> "$GITHUB_OUTPUT"
 
           echo "Detected version: $VER"
-          echo "Release tag will be: v$VER"
+          echo "Release tag: v$VER"
           echo "InformationalVersion: $VER 去广告版"
 
-      # --- Remove Promotion menu item (edit source directly) ---
+      # 只用 yml：构建前自动移除“推广”菜单按钮（menuPromotion），并清理 code-behind 引用
       - name: Remove Promotion menu item (menuPromotion) from MainWindow.axaml + code-behind
         shell: bash
         run: |
@@ -167,32 +139,34 @@ PY
           echo "AXAML=$AXAML"
           echo "CS=$CS"
 
-          python3 - <<'PY' "$AXAML"
+          # 1) 删除 XAML 中 menuPromotion 那一行
+          python3 -c '
 import re, pathlib, sys
-axaml = pathlib.Path(sys.argv[1])
-s = axaml.read_text(encoding="utf-8", errors="ignore")
-s2 = re.sub(r'(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?', '', s)
-if s2 == s:
-    s2 = re.sub(r'\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '', s)
-if s2 == s:
-    raise SystemExit("menuPromotion not removed from XAML (pattern not matched)")
-if re.search(r'x:Name\s*=\s*"menuPromotion"', s2):
-    raise SystemExit("menuPromotion still exists in XAML after edit")
+axaml=pathlib.Path(sys.argv[1])
+s=axaml.read_text(encoding="utf-8", errors="ignore")
+s2=re.sub(r"(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*\"menuPromotion\"[^>]*/>\s*\r?\n?","",s)
+if s2==s:
+  s2=re.sub(r"\s*<MenuItem\b[^>]*\bx:Name\s*=\s*\"menuPromotion\"[^>]*/>\s*","",s)
+if s2==s:
+  raise SystemExit("menuPromotion not removed from XAML (pattern not matched)")
+if re.search(r"x:Name\s*=\s*\"menuPromotion\"", s2):
+  raise SystemExit("menuPromotion still exists in XAML after edit")
 axaml.write_text(s2, encoding="utf-8")
 print("OK: menuPromotion removed from XAML")
-PY
+' "$AXAML"
 
-          python3 - <<'PY' "$CS"
+          # 2) 清理 code-behind 中所有 menuPromotion 引用（避免 CS0103）
+          python3 -c '
 import re, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-s = p.read_text(encoding="utf-8", errors="ignore")
-s2 = re.sub(r'(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '', s)
-s2 = re.sub(r'(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '', s2)
+p=pathlib.Path(sys.argv[1])
+s=p.read_text(encoding="utf-8", errors="ignore")
+s2=re.sub(r"(?m)^\s*.*\bmenuPromotion\b.*\r?\n","",s)
+s2=re.sub(r"(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}","",s2)
 p.write_text(s2, encoding="utf-8")
-if re.search(r'\bmenuPromotion\b', s2):
-    raise SystemExit("menuPromotion still referenced in code-behind after cleanup")
+if re.search(r"\bmenuPromotion\b", s2):
+  raise SystemExit("menuPromotion still referenced in code-behind after cleanup")
 print("OK: menuPromotion references removed from code-behind")
-PY
+' "$CS"
 
       - name: Build (Windows x64 desktop only)
         shell: bash
@@ -203,12 +177,14 @@ PY
 
           cd v2rayN
 
+          # Desktop（Avalonia）主程序
           dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true -p:EnableWindowsTargeting=true \
             -p:Version="$VER" -p:InformationalVersion="$INFO" \
             -o "$OutputPath64"
 
+          # AmazTool 同目录输出（保持与上游发布结构一致/体积也会一致）
           dotnet publish ./AmazTool/AmazTool.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
@@ -225,18 +201,17 @@ PY
       - name: Package release zip archive (same as upstream)
         shell: bash
         run: |
+          set -euo pipefail
           chmod 755 package-release-zip.sh
           ./package-release-zip.sh "$OutputArch" "$OutputPath64"
           mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-desktop-noads.zip"
 
-      # --- tag 与上游一致：vX.Y.Z （强制更新同名 tag 指向最新 commit） ---
+      # tag 与上游一致：vX.Y.Z（强制移动同名 tag 到最新提交）
       - name: Create/Update tag to match upstream version
         shell: bash
         run: |
           set -euo pipefail
           TAG="${{ steps.ver.outputs.tag }}"
-
-          # 强制移动同名 tag 到当前提交（你要求“和上游一致”就必须这样做）
           git tag -f "$TAG"
           git push -f origin "$TAG"
 
