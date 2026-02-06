@@ -1,0 +1,223 @@
+name: sync_and_build_windows (no-promo, upstream package, x64 only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force build even if no upstream updates"
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "If set, upload zip to GitHub Release with this tag (e.g. v7.18.0)"
+        required: false
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 */6 * * *" # 每6小时检查一次（UTC）
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-build-windows
+  cancel-in-progress: true
+
+env:
+  OutputArch: "windows-64"
+  OutputPath64: "${{ github.workspace }}/v2rayN/Release/windows-64"
+
+jobs:
+  sync_and_build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo (with submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/2dust/v2rayN.git 2>/dev/null || true
+          git fetch upstream --prune
+          git remote set-head upstream -a || true
+
+      - name: Detect upstream default branch (main/master)
+        id: up
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(git symbolic-ref -q refs/remotes/upstream/HEAD || true)"
+          if [[ -n "$ref" ]]; then
+            b="${ref#refs/remotes/upstream/}"
+          else
+            if git show-ref --verify --quiet refs/remotes/upstream/main; then b="main";
+            elif git show-ref --verify --quiet refs/remotes/upstream/master; then b="master";
+            else echo "Cannot resolve upstream default branch"; exit 1; fi
+          fi
+          echo "branch=$b" >> "$GITHUB_OUTPUT"
+          echo "Upstream default branch: $b"
+
+      - name: Detect upstream changes
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          UP="upstream/${{ steps.up.outputs.branch }}"
+          behind="$(git rev-list --count "HEAD..$UP")"
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          echo "Upstream ahead by $behind commits"
+
+      - name: Exit if no upstream updates (unless forced)
+        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
+        shell: bash
+        run: |
+          echo "No upstream updates. Exit."
+          exit 0
+
+      - name: Merge upstream & push (only if changed)
+        if: steps.diff.outputs.behind != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          UP="upstream/${{ steps.up.outputs.branch }}"
+          git merge --no-edit "$UP"
+          git push origin HEAD
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # 这段沿用你“不错版本”的思路：自动定位 MainWindow axaml & code-behind，再删除 menuPromotion
+      - name: Locate MainWindow axaml & code-behind
+        id: locate_mainwindow
+        shell: bash
+        run: |
+          set -euo pipefail
+          axaml="$(find . -type f -name 'MainWindow.axaml' | grep -E 'v2rayN\.Desktop/Views/MainWindow\.axaml$' | head -n 1 || true)"
+          cs="$(find . -type f -name 'MainWindow.axaml.cs' | grep -E 'v2rayN\.Desktop/Views/MainWindow\.axaml\.cs$' | head -n 1 || true)"
+          if [[ -z "$axaml" ]]; then echo "MainWindow.axaml not found"; exit 1; fi
+          if [[ -z "$cs" ]]; then echo "MainWindow.axaml.cs not found"; exit 1; fi
+          echo "axaml=$axaml" >> "$GITHUB_OUTPUT"
+          echo "cs=$cs" >> "$GITHUB_OUTPUT"
+          echo "AXAML=$axaml"
+          echo "CS=$cs"
+
+      - name: Remove Promotion menu item (XAML) + Fix code-behind references
+        shell: bash
+        run: |
+          set -euo pipefail
+          AXAML="${{ steps.locate_mainwindow.outputs.axaml }}"
+          CS="${{ steps.locate_mainwindow.outputs.cs }}"
+
+          python3 - <<'PY'
+          import re, pathlib, sys
+
+          axaml = pathlib.Path(r"""__AXAML__""")
+          cs    = pathlib.Path(r"""__CS__""")
+
+          x = axaml.read_text(encoding="utf-8", errors="ignore")
+
+          # 1) 删除 XAML 里 menuPromotion 那一行（自闭合 MenuItem）
+          pat_line = re.compile(r'(?m)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>[ \t]*\r?\n?')
+          x2, n = pat_line.subn("", x)
+
+          # 兜底：删除任何 menuPromotion MenuItem 片段
+          if n == 0:
+            pat_any = re.compile(r'[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>[ \t]*')
+            x2, n = pat_any.subn("", x)
+
+          # 如果本来就没有，允许通过（因为上游可能改名/你已删过）
+          if n > 0:
+            axaml.write_text(x2, encoding="utf-8")
+
+          # Guard：XAML 里绝对不能再出现 menuPromotion
+          xf = axaml.read_text(encoding="utf-8", errors="ignore")
+          if re.search(r'x:Name\s*=\s*"menuPromotion"', xf):
+            print("ERROR: menuPromotion still exists in XAML")
+            sys.exit(1)
+
+          # 2) 清理 code-behind 所有 menuPromotion 引用
+          c = cs.read_text(encoding="utf-8", errors="ignore")
+
+          # 删除包含 menuPromotion 的整行（含事件绑定）
+          c2 = re.sub(r'(?m)^[ \t]*.*\bmenuPromotion\b.*\r?\n', "", c)
+
+          # 兜底：删除 MenuPromotion_Click 这类方法体（如果存在）
+          c2 = re.sub(r'(?s)\n[ \t]*(private|public|internal)\s+.*\b(MenuPromotion|menuPromotion)\w*\s*\([^)]*\)\s*\{.*?\}\s*\n', "\n", c2)
+
+          if c2 != c:
+            cs.write_text(c2, encoding="utf-8")
+
+          # Guard：标识符层面不能残留
+          cf = cs.read_text(encoding="utf-8", errors="ignore")
+          if re.search(r'(?<![A-Za-z0-9_])menuPromotion(?![A-Za-z0-9_])', cf):
+            print("ERROR: menuPromotion still referenced in code-behind")
+            sys.exit(1)
+
+          print("OK: menuPromotion removed (XAML + code-behind).")
+          PY
+        env:
+          # 把路径塞进 python 模板
+          __AXAML__: ${{ steps.locate_mainwindow.outputs.axaml }}
+          __CS__: ${{ steps.locate_mainwindow.outputs.cs }}
+
+      # ===== 关键：按上游方式 publish 到 v2rayN/Release/windows-64 =====
+      - name: Build (publish) x64 into upstream release folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OutputPath64}"
+          cd v2rayN
+
+          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
+            -c Release -r win-x64 \
+            -p:SelfContained=true -p:EnableWindowsTargeting=true \
+            -o "${OutputPath64}"
+
+          dotnet publish ./AmazTool/AmazTool.csproj \
+            -c Release -r win-x64 \
+            -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
+            -o "${OutputPath64}"
+
+      - name: Upload raw publish folder (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-windows-64-raw-publish
+          path: ${{ env.OutputPath64 }}
+
+      # ===== 关键：调用上游 package-release-zip.sh 生成“带 bin/结构”的zip =====
+      - name: Package release zip archive (same style as upstream)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 755 package-release-zip.sh
+          ./package-release-zip.sh "${OutputArch}" "${OutputPath64}"
+          mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-去广告版.zip"
+
+      - name: Upload packaged zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-windows-64-去广告版.zip
+          path: v2rayN-windows-64-去广告版.zip
+
+      - name: Upload zip to GitHub Release (optional)
+        if: inputs.release_tag != ''
+        uses: svenstaro/upload-release-action@v2
+        with:
+          tag: ${{ inputs.release_tag }}
+          file: v2rayN-windows-64-去广告版.zip
+          asset_name: v2rayN-windows-64-去广告版.zip
+          overwrite: true
+          prerelease: false
