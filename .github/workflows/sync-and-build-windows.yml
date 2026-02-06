@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-and-build-windows
+  cancel-in-progress: true
+
 jobs:
   sync_and_build:
     runs-on: windows-latest
@@ -29,26 +33,29 @@ jobs:
         run: |
           git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
           git fetch upstream --prune
+          # 生成/刷新 upstream/HEAD（指向上游默认分支）
+          git remote set-head upstream -a
 
       - name: Detect upstream changes
         id: diff
         shell: pwsh
         run: |
-          $cur = $env:GITHUB_REF_NAME
-
-          if (git show-ref --verify --quiet refs/remotes/upstream/master) {
-            $up = "upstream/master"
-          } else {
-            $up = "upstream/main"
+          # 读取上游默认分支（不再猜 main/master）
+          $upRef = (git symbolic-ref -q refs/remotes/upstream/HEAD)
+          if (-not $upRef) {
+            Write-Error "Cannot resolve upstream HEAD"
+            exit 1
           }
+          $up = $upRef -replace '^refs/remotes/', ''   # refs/remotes/upstream/master -> upstream/master
+          Write-Host "Upstream default branch: $up"
 
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          if ($behind -eq 0) {
-            Write-Host "No upstream updates"
+          if ([int]$behind -eq 0) {
+            Write-Host "✅ No upstream updates"
           } else {
-            Write-Host "Upstream ahead by $behind commits"
+            Write-Host "⬇️ Upstream ahead by $behind commits"
           }
 
       - name: Exit if no upstream updates
@@ -61,16 +68,18 @@ jobs:
       - name: Merge upstream & push
         shell: pwsh
         run: |
-          if (git show-ref --verify --quiet refs/remotes/upstream/master) {
-            $up = "upstream/master"
-          } else {
-            $up = "upstream/main"
+          $upRef = (git symbolic-ref -q refs/remotes/upstream/HEAD)
+          if (-not $upRef) {
+            Write-Error "Cannot resolve upstream HEAD"
+            exit 1
           }
+          $up = $upRef -replace '^refs/remotes/', ''
+          Write-Host "Merging $up"
 
           git merge --no-edit $up
           git push origin HEAD
 
-      # ===== 同步完成，下面开始构建 =====
+      # ===== 同步完成，下面开始构建 WPF =====
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -86,8 +95,11 @@ jobs:
             $s = Get-Content -Raw -Encoding UTF8 $path
             $orig = $s
 
+            # 删除引用 PromoteCommand 的 Button/MenuItem（兼容成对标签）
             $s = [regex]::Replace($s, '(?s)<Button\b[^>]*\bPromoteCommand\b[^>]*>.*?</Button>', '')
             $s = [regex]::Replace($s, '(?s)<MenuItem\b[^>]*\bPromoteCommand\b[^>]*>.*?</MenuItem>', '')
+
+            # 兜底：删除包含“推广”字样的按钮/菜单（有些版本不叫 PromoteCommand）
             $s = [regex]::Replace($s, '(?s)<Button\b[^>]*>.*?推广.*?</Button>', '')
             $s = [regex]::Replace($s, '(?s)<MenuItem\b[^>]*>.*?推广.*?</MenuItem>', '')
 
@@ -98,13 +110,20 @@ jobs:
             return $false
           }
 
+          $changed = 0
           Get-ChildItem -Recurse -File -Include *.xaml |
             Where-Object { $_.FullName -match '\\v2rayN\\' } |
             ForEach-Object {
               if (Remove-PromoteFromXaml $_.FullName) {
-                Write-Host "removed promote in $($_.FullName)"
+                Write-Host "✅ removed promote in $($_.FullName)"
+                $changed++
               }
             }
+
+          if ($changed -eq 0) {
+            Write-Host "⚠️ No promote entry matched. Upstream may have renamed it."
+            # 如需严格防回归可改为：exit 1
+          }
 
       - name: Locate WPF csproj
         id: locate
@@ -127,6 +146,8 @@ jobs:
             -p:SelfContained=true `
             -p:PublishSingleFile=false `
             -p:PublishTrimmed=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
             -o publish
 
       - name: Zip
