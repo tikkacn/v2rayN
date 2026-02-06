@@ -1,122 +1,231 @@
-name: sync and build Windows desktop (Avalonia UI)
+name: sync & build Windows (WPF noads)
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
+        description: "Create/Upload Release assets to this tag (e.g. v7.18.0). Leave empty to skip Release upload."
         required: false
         type: string
+      force_build:
+        description: "Build even if upstream has no new commits"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 */6 * * *"   # 每 6 小时检查一次（你可改）
   push:
-    branches:
-      - master
+    branches: [ master ]
+
+permissions:
+  contents: write
 
 env:
   OutputArch: "windows-64"
-  OutputArchArm: "windows-arm64"
   OutputPath64:  "${{ github.workspace }}/v2rayN/Release/windows-64"
-  OutputPathArm64:  "${{ github.workspace }}/v2rayN/Release/windows-arm64"
+  # 只要 WPF：不构建 arm64（你如果以后要，再加回来）
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        configuration: [Release]
-
+  sync_and_build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v6.0.2
-      with:
-        submodules: 'recursive'
-        fetch-depth: '0'
+      - name: Checkout current repo (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-    - name: Setup
-      uses: actions/setup-dotnet@v5.0.1
-      with:
-        dotnet-version: '8.0.x'
+      - name: Configure git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    - name: Merge upstream & push
-      shell: bash
-      run: |
-        git merge --no-edit "$(steps.diff.outputs.up)"
-        git push origin HEAD
+      - name: Add & fetch upstream (2dust/v2rayN)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/2dust/v2rayN.git
+          git fetch upstream --tags --prune
 
-    - name: Setup .NET 8
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: "8.0.x"
+      - name: Detect upstream default branch (main/master)
+        id: upstream_branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet refs/remotes/upstream/main; then
+            echo "name=main" >> "$GITHUB_OUTPUT"
+          elif git show-ref --verify --quiet refs/remotes/upstream/master; then
+            echo "name=master" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cannot find upstream/main or upstream/master" >&2
+            git branch -r | sed 's/^/  /'
+            exit 1
+          fi
 
-    # --- Detect upstream version ---
-    - name: Detect upstream version
-      id: ver
-      shell: bash
-      run: |
-        set -euo pipefail
+      - name: Detect upstream changes
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          UP="upstream/${{ steps.upstream_branch.outputs.name }}"
+          git fetch origin --prune
 
-        python3 - <<'PY'
-        import re, pathlib
+          # 计算 upstream 比当前分支领先多少
+          BEHIND="$(git rev-list --count HEAD..$UP)"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Upstream ahead by $BEHIND commits"
 
-        cands = [
-            pathlib.Path("v2rayN/Directory.Build.props"),
-            pathlib.Path("v2rayN/Directory.Build.targets"),
-            pathlib.Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),
-            pathlib.Path("v2rayN/ServiceLib/ServiceLib.csproj"),
-        ]
+      - name: Exit if no upstream updates (unless forced)
+        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
+        shell: bash
+        run: |
+          echo "No upstream updates. Exit."
+          exit 0
 
-        ver = None
-        for p in cands:
-            if not p.exists():
-                continue
-            s = p.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
-            if m:
-                ver = m.group(1).strip()
-                break
+      - name: Merge upstream & push
+        shell: bash
+        run: |
+          set -euo pipefail
+          UP="upstream/${{ steps.upstream_branch.outputs.name }}"
+          git merge --no-edit "$UP"
+          git push origin HEAD
 
-        if not ver:
-            raise SystemExit("Cannot find <Version> in props/csproj")
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
 
-        print(ver.lstrip("v").strip())
-        PY
+      # ========= 核心：自动去推广（不靠 patch 文件） =========
+      - name: Remove Promotion entry (auto) from XAML + code-behind
+        shell: bash
+        run: |
+          set -euo pipefail
 
-        VER="$(python3 /dev/stdin < /dev/null || true)"
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
 
-    - name: Remove Promotion menu item (XAML) + Fix code-behind references
-      shell: bash
-      run: |
-        sed -i '/menuPromotion/d' v2rayN.Desktop/Views/MainWindow.xaml
-        sed -i '/menuPromotion/d' v2rayN.Desktop/Views/MainWindow.xaml.cs
-        echo "menuPromotion removed from XAML"
+          # 1) 找 MainWindow.axaml
+          axaml = None
+          for p in Path(".").rglob("MainWindow.axaml"):
+            # 只选桌面项目的 Views 目录优先
+            s = str(p).replace("\\","/")
+            if "v2rayN.Desktop/Views/MainWindow.axaml" in s:
+              axaml = p
+              break
+          if axaml is None:
+            # 兜底：任意一个 MainWindow.axaml
+            axaml = next(Path(".").rglob("MainWindow.axaml"), None)
 
-    - name: Publish
-      run: |
-        cd v2rayN 
-        dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj -c Release -r win-x64 -p:SelfContained=true -p:EnableWindowsTargeting=true -o $OutputPath64
-        dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj -c Release -r win-arm64 -p:SelfContained=true -p:EnableWindowsTargeting=true -o $OutputPathArm64
+          if axaml is None or not axaml.exists():
+            raise SystemExit("MainWindow.axaml not found (path changed?)")
 
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v6.0.0
-      with:
-        name: v2rayN-windows-desktop
-        path: |
-          ${{ github.workspace }}/v2rayN/Release/windows*
+          text = axaml.read_text(encoding="utf-8", errors="ignore")
 
-    # release zip archive
-    - name: Package release zip archive
-      if: github.event.inputs.release_tag != ''
-      run: |
-        chmod 755 package-release-zip.sh
-        ./package-release-zip.sh $OutputArch $OutputPath64
-        mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-desktop.zip"
-        ./package-release-zip.sh $OutputArchArm $OutputPathArm64
-        mv "v2rayN-${OutputArchArm}.zip" "v2rayN-${OutputArchArm}-desktop.zip"
+          # 2) 删除 menuPromotion 这行（自闭合）
+          #    <MenuItem x:Name="menuPromotion" ... />
+          text2 = re.sub(r'^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n',
+                         '', text, flags=re.M)
 
-    - name: Upload zip archive to release
-      uses: svenstaro/upload-release-action@v2
-      if: github.event.inputs.release_tag != ''
-      with:
-        file: ${{ github.workspace }}/v2rayN*.zip
-        tag: ${{ github.event.inputs.release_tag }}
-        file_glob: true
-        prerelease: true
+          # 3) 删除 menuPromotion 这种“非自闭合块”（以防将来改成 <MenuItem>...</MenuItem>）
+          #    非严谨 XML 解析，但对这类 UI 文件很实用
+          text2 = re.sub(
+              r'\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>\s*\r?\n',
+              '',
+              text2,
+              flags=re.S
+          )
+
+          # 4) 进一步清理：Header/资源里包含 Promotion/推广/Donate/Sponsor/github_2dust 的 MenuItem（尽量移除入口）
+          #    （避免出现“没文字但还有按钮/喇叭图标”的残留）
+          patterns = [
+            r'Promotion', r'推广', r'Donate', r'Sponsor', r'github_2dust'
+          ]
+
+          # 删除含这些关键词的“单行自闭合 MenuItem”
+          for kw in patterns:
+            text2 = re.sub(rf'^\s*<MenuItem\b[^>]*{kw}[^>]*/>\s*\r?\n', '', text2, flags=re.M)
+
+          if text2 != text:
+            axaml.write_text(text2, encoding="utf-8")
+            print(f"Updated: {axaml}")
+          else:
+            print(f"No changes applied to: {axaml} (maybe already removed)")
+
+          # 5) 清理 code-behind 里的引用（避免 CS0103）
+          cs = axaml.with_suffix(".axaml.cs")
+          if cs.exists():
+            cst = cs.read_text(encoding="utf-8", errors="ignore")
+
+            # 删除所有包含 menuPromotion 的行（常见是 Click 绑定、FindControl、赋值等）
+            cst2 = re.sub(r'^\s*.*\bmenuPromotion\b.*\r?\n', '', cst, flags=re.M)
+
+            # 再兜底：删除包含 Promotion/推广 的“打开浏览器/链接”行（避免换名）
+            cst2 = re.sub(r'^\s*.*(Promotion|推广|github_2dust|Donate|Sponsor).*?\r?\n', '', cst2, flags=re.M)
+
+            if cst2 != cst:
+              cs.write_text(cst2, encoding="utf-8")
+              print(f"Updated: {cs}")
+            else:
+              print(f"No changes applied to: {cs}")
+
+          else:
+            print(f"Code-behind not found: {cs} (skip)")
+          PY
+
+      # ========= 按上游方式 publish（这样输出目录结构更像原版） =========
+      - name: Publish (win-x64, self-contained)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd v2rayN
+
+          # Desktop(WPF/Avalonia)
+          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
+            -c Release -r win-x64 \
+            -p:SelfContained=true \
+            -p:EnableWindowsTargeting=true \
+            -o "$OutputPath64"
+
+          # AmazTool（上游也会一起打进同一个输出目录）
+          dotnet publish ./AmazTool/AmazTool.csproj \
+            -c Release -r win-x64 \
+            -p:SelfContained=true \
+            -p:EnableWindowsTargeting=true \
+            -p:PublishTrimmed=true \
+            -o "$OutputPath64"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-windows-noads
+          path: |
+            ${{ env.OutputPath64 }}
+
+      # ========= Release 打包与上传（可选） =========
+      - name: Package release zip archive (same style as upstream)
+        if: inputs.release_tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/v2rayN"
+
+          chmod 755 package-release-zip.sh
+          ./package-release-zip.sh "$OutputArch" "$OutputPath64"
+
+          # 给 zip 加后缀（不改上游版本号，只在文件名体现 noads）
+          mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-noads.zip"
+
+      - name: Upload zip archive to release
+        if: inputs.release_tag != ''
+        uses: svenstaro/upload-release-action@v2
+        with:
+          file: ${{ github.workspace }}/v2rayN/v2rayN-*.zip
+          tag: ${{ inputs.release_tag }}
+          file_glob: true
+          prerelease: false
+          overwrite: true
