@@ -3,7 +3,7 @@ name: sync_and_build_windows
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
 
 permissions:
   contents: write
@@ -45,16 +45,20 @@ jobs:
           $up = $upRef -replace '^refs/remotes/', ''
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Upstream ahead by $behind commits"
 
       - name: Exit if no upstream updates
         if: steps.diff.outputs.behind == '0'
         shell: pwsh
-        run: exit 0
+        run: |
+          Write-Host "No upstream updates. Exit."
+          exit 0
 
       - name: Merge upstream & push
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
           git merge --no-edit $up
           git push origin HEAD
@@ -64,36 +68,93 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Locate MainWindow.axaml
-        id: locate_axaml
+      - name: Locate MainWindow axaml & code-behind
+        id: locate_mainwindow
         shell: pwsh
         run: |
           $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
             Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
             Select-Object -First 1
           if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
-          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-      - name: Remove Promotion menu item
+          $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
+            Select-Object -First 1
+          if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
+
+          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "AXAML: $($axaml.FullName)"
+          Write-Host "CODE : $($cs.FullName)"
+
+      - name: Remove Promotion menu item (XAML) + Fix code-behind references
         shell: pwsh
         run: |
-          $file = "${{ steps.locate_axaml.outputs.axaml }}"
-          $content = Get-Content $file -Raw -Encoding UTF8
-          $pattern = '^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          $new = [regex]::Replace($content, $pattern, '', 'Multiline')
-          if ($new -eq $content) {
-            $new = [regex]::Replace($content, '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '')
+          $ErrorActionPreference = "Stop"
+
+          $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
+          $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
+
+          # ---- 1) 删除 XAML 里的 menuPromotion MenuItem ----
+          $x = Get-Content $axaml -Raw -Encoding UTF8
+
+          $patternLine = '^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $x2 = [regex]::Replace($x, $patternLine, '', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+
+          if ($x2 -eq $x) {
+            # 兜底：非整行写法
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
+            $x2 = [regex]::Replace($x, $patternAny, '')
           }
-          if ($new -eq $content) { Write-Error "menuPromotion not removed"; exit 1 }
-          Set-Content $file $new -Encoding UTF8
+
+          if ($x2 -eq $x) {
+            Write-Error "menuPromotion not removed from XAML (pattern not matched)."
+            exit 1
+          }
+
+          Set-Content $axaml $x2 -Encoding UTF8
+
+          # Guard：确保 XAML 已无 menuPromotion
+          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
+          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
+            Write-Error "menuPromotion still exists in XAML after edit."
+            exit 1
+          }
+
+          Write-Host "✅ menuPromotion removed from XAML"
+
+          # ---- 2) 修正 code-behind：删除/注释对 menuPromotion 的引用 ----
+          $c = Get-Content $cs -Raw -Encoding UTF8
+
+          # 常见写法：menuPromotion.Click += ...
+          $c2 = $c -replace '^\s*menuPromotion\.[^\r\n]*\r?\n', ''
+          # 兜底：任何包含 menuPromotion 的单行（避免残留引用导致 CS0103）
+          $c2 = $c2 -replace '^\s*.*\bmenuPromotion\b.*\r?\n', ''
+
+          if ($c2 -ne $c) {
+            Set-Content $cs $c2 -Encoding UTF8
+            Write-Host "✅ menuPromotion references removed from code-behind"
+          } else {
+            # 如果没有引用也没关系（不同版本可能已经不用）
+            Write-Host "ℹ️ No menuPromotion references found in code-behind (ok)"
+          }
+
+          # 最终 Guard：如果还存在 menuPromotion 标识符，直接失败（防回归/防漏删）
+          $final = Get-Content $cs -Raw -Encoding UTF8
+          if ($final -match '\bmenuPromotion\b') {
+            Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
+            exit 1
+          }
 
       - name: Locate v2rayN.Desktop.csproj
         id: locate_csproj
         shell: pwsh
         run: |
           $csproj = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
-          if (-not $csproj) { Write-Error "csproj not found"; exit 1 }
+          if (-not $csproj) { Write-Error "v2rayN.Desktop.csproj not found"; exit 1 }
           "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Using csproj: $($csproj.FullName)"
 
       - name: Restore
         shell: pwsh
@@ -111,8 +172,9 @@ jobs:
       - name: Zip artifact
         shell: pwsh
         run: |
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           New-Item dist -ItemType Directory -Force | Out-Null
-          Compress-Archive publish\* dist\v2rayN-windows-64.zip -Force
+          Compress-Archive -Path publish\* -DestinationPath dist\v2rayN-windows-64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
