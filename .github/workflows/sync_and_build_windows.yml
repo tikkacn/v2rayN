@@ -89,119 +89,71 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      - name: Remove Promotion menu item (menuPromotion) from XAML + code-behind (robust) + Guard
+      # ✅ 核心：不再碰 MainWindow.axaml.cs，只在 XAML 中把推广菜单隐藏
+      - name: Disable Promotion menu item in XAML (IsVisible=false) + Guard
         shell: bash
         run: |
           set -euo pipefail
 
-          # 1) Locate files (works even if repo path changes slightly)
           AXAML="$(git ls-files | grep -E 'v2rayN\.Desktop/Views/MainWindow\.axaml$' | head -n 1 || true)"
-          CS="$(git ls-files | grep -E 'v2rayN\.Desktop/Views/MainWindow\.axaml\.cs$' | head -n 1 || true)"
-
           if [ -z "${AXAML}" ]; then
             echo "MainWindow.axaml not found"
             exit 1
           fi
-          if [ -z "${CS}" ]; then
-            echo "MainWindow.axaml.cs not found"
-            exit 1
-          fi
 
-          echo "AXAML=$AXAML"
-          echo "CS=$CS"
-
-          # 2) Patch with python (avoid YAML/heredoc indentation pitfalls)
-          python3 - "$AXAML" "$CS" <<'PY'
+          python3 - "$AXAML" <<'PY'
           import re, sys
           from pathlib import Path
 
-          axaml_path = Path(sys.argv[1])
-          cs_path    = Path(sys.argv[2])
+          p = Path(sys.argv[1])
+          x = p.read_text(encoding="utf-8", errors="ignore")
 
-          x = axaml_path.read_text(encoding="utf-8", errors="ignore")
+          # Find the MenuItem that has x:Name="menuPromotion" (self-closing or normal tag)
+          # If it already has IsVisible, force it to False; otherwise inject IsVisible="False".
+          def repl(m):
+            tag = m.group(0)
+            if re.search(r'\bIsVisible\s*=\s*"', tag):
+              tag = re.sub(r'\bIsVisible\s*=\s*"[^"]*"', 'IsVisible="False"', tag)
+            else:
+              # inject before end of start tag
+              tag = re.sub(r'(\s*/?>)', r' IsVisible="False"\1', tag, count=1)
+            return tag
 
-          # Remove self-closing MenuItem with x:Name="menuPromotion"
-          pat1 = re.compile(r'(?m)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>[ \t]*\r?\n?')
-          x2 = pat1.sub("", x)
+          # Match start tag of MenuItem containing x:Name="menuPromotion"
+          pat = re.compile(r'<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*?/?>', re.IGNORECASE)
+          x2, n = pat.subn(repl, x)
 
-          # Defensive: non-self-closing <MenuItem ...>...</MenuItem>
-          pat2 = re.compile(r'(?ms)^[ \t]*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>[ \t]*\r?\n?')
-          x2 = pat2.sub("", x2)
+          if n == 0:
+            raise SystemExit("ERROR: cannot find menuPromotion MenuItem in MainWindow.axaml (upstream markup changed?)")
 
-          if re.search(r'\bx:Name\s*=\s*"menuPromotion"\b', x2):
-            raise SystemExit("ERROR: menuPromotion still exists in MainWindow.axaml after cleanup")
+          # Guard: ensure IsVisible="False" is present on that element
+          if not re.search(r'<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*\bIsVisible\s*=\s*"False"', x2, re.IGNORECASE):
+            raise SystemExit("ERROR: failed to enforce IsVisible=False on menuPromotion")
 
-          if x2 == x:
-            # Upstream changed markup and we didn't match -> fail loudly
-            raise SystemExit("ERROR: menuPromotion pattern not matched; upstream markup may have changed")
-
-          axaml_path.write_text(x2, encoding="utf-8", newline="\n")
-          print("✅ menuPromotion removed from XAML")
-
-          c = cs_path.read_text(encoding="utf-8", errors="ignore")
-
-          # Remove any lines that reference menuPromotion
-          c2 = re.sub(r'(?m)^[^\n]*\bmenuPromotion\b[^\n]*\r?\n', "", c)
-
-          # Remove MenuPromotion_Click method (if exists) - supports async/void and modifiers
-          c2 = re.sub(
-            r'(?ms)^[ \t]*(?:private|public|protected|internal)?[ \t]*(?:async[ \t]+)?void[ \t]+MenuPromotion_Click\s*\([^)]*\)\s*\{.*?\}\s*',
-            "",
-            c2
-          )
-
-          cs_path.write_text(c2, encoding="utf-8", newline="\n")
-
-          final_cs = cs_path.read_text(encoding="utf-8", errors="ignore")
-          if re.search(r'\bmenuPromotion\b', final_cs):
-            raise SystemExit("ERROR: menuPromotion still referenced in MainWindow.axaml.cs after cleanup")
-
-          print("✅ code-behind cleaned")
+          p.write_text(x2, encoding="utf-8", newline="\n")
+          print("✅ menuPromotion kept for code-behind but hidden (IsVisible=False)")
           PY
-
-          # Final guard: both files must not contain menuPromotion
-          if grep -RIn --line-number -E '\bmenuPromotion\b' "$AXAML" "$CS"; then
-            echo "ERROR: menuPromotion still exists after cleanup"
-            exit 1
-          fi
 
       - name: Detect upstream version (for release title)
         id: ver
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          candidates = [
-            Path("v2rayN/Directory.Build.props"),
-            Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),
-            Path("v2rayN/ServiceLib/ServiceLib.csproj"),
-          ]
-          ver = None
-          for p in candidates:
-            if not p.exists():
-              continue
-            s = p.read_text(encoding="utf-8", errors="ignore")
-            m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
-            if m:
-              ver = m.group(1).strip()
-              break
-          if not ver:
-            raise SystemExit("Cannot find <Version> in props/csproj")
-          print(ver)
-          PY
           VER="$(python3 - <<'PY'
           import re
           from pathlib import Path
           candidates=[Path("v2rayN/Directory.Build.props"),Path("v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"),Path("v2rayN/ServiceLib/ServiceLib.csproj")]
+          ver=None
           for p in candidates:
             if p.exists():
               s=p.read_text(encoding="utf-8", errors="ignore")
               m=re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
               if m:
-                print(m.group(1).strip());break
+                ver=m.group(1).strip()
+                break
+          if not ver:
+            raise SystemExit("Cannot find <Version> in props/csproj")
+          print(ver)
           PY
           )"
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
@@ -221,7 +173,6 @@ jobs:
             -p:SelfContained=true -p:EnableWindowsTargeting=true \
             -o "${OUTPUT_DIR}"
 
-          # AmazTool (upstream also publishes it into same output dir)
           dotnet publish ./AmazTool/AmazTool.csproj \
             -c Release -r win-x64 \
             -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
@@ -241,8 +192,6 @@ jobs:
           chmod +x package-release-zip.sh
           ./package-release-zip.sh "${OUTPUT_ARCH}" "${OUTPUT_DIR}"
 
-          # Upstream output: v2rayN-windows-64.zip
-          # Rename to noads
           if [ -f "v2rayN-${OUTPUT_ARCH}.zip" ]; then
             mv "v2rayN-${OUTPUT_ARCH}.zip" "v2rayN-${OUTPUT_ARCH}-noads.zip"
           else
@@ -267,4 +216,4 @@ jobs:
           prerelease: false
           overwrite: true
           release_name: "v${{ steps.ver.outputs.ver }} 去广告版"
-          body: "基于上游 v${{ steps.ver.outputs.ver }} 自动同步构建（去广告版：移除推广菜单）。"
+          body: "基于上游 v${{ steps.ver.outputs.ver }} 自动同步构建（去广告版：隐藏推广菜单入口）。"
