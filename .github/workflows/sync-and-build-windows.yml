@@ -33,7 +33,6 @@ jobs:
         run: |
           git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
           git fetch upstream --prune
-          # 生成/刷新 upstream/HEAD（指向上游默认分支）
           git remote set-head upstream -a
 
       - name: Detect upstream changes
@@ -41,133 +40,97 @@ jobs:
         shell: pwsh
         run: |
           $upRef = (git symbolic-ref -q refs/remotes/upstream/HEAD)
-          if (-not $upRef) {
-            Write-Error "Cannot resolve upstream HEAD"
-            exit 1
-          }
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
-          Write-Host "Upstream default branch: $up"
 
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          if ([int]$behind -eq 0) {
-            Write-Host "✅ No upstream updates"
-          } else {
-            Write-Host "⬇️ Upstream ahead by $behind commits"
-          }
-
       - name: Exit if no upstream updates
         if: steps.diff.outputs.behind == '0'
         shell: pwsh
-        run: |
-          Write-Host "✅ No updates, stop workflow"
-          exit 0
+        run: exit 0
 
       - name: Merge upstream & push
         shell: pwsh
         run: |
           $upRef = (git symbolic-ref -q refs/remotes/upstream/HEAD)
-          if (-not $upRef) {
-            Write-Error "Cannot resolve upstream HEAD"
-            exit 1
-          }
           $up = $upRef -replace '^refs/remotes/', ''
-          Write-Host "Merging $up"
-
           git merge --no-edit $up
           git push origin HEAD
 
-      # ===== 同步完成，下面开始构建 WPF =====
+      # ===== 构建阶段 =====
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Remove promote entry (auto, strong) + Guard
+      - name: Remove promote entry (XAML + Resx) + Guard
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # 只对 WPF 的 XAML 动手
-          $xamlFiles = Get-ChildItem -Recurse -File -Include *.xaml |
-            Where-Object { $_.FullName -match '\\v2rayN\\' }
-
-          # 这些关键字/绑定基本能覆盖 WPF 里的“推广/赞助/捐赠”入口
-          $kw = @(
-            "ResUI\.Promote",
-            "PromoteCommand",
-            "\bPromote\b",
-            "推广",
-            "Sponsor",
-            "Donate",
-            "赞助"
-          )
+          # ---------- 1. 处理 XAML ----------
+          $kw = @("推广","ResUI\.Promote","PromoteCommand","\bPromote\b","Sponsor","Donate","赞助")
           $kwRegex = "(" + ($kw -join "|") + ")"
 
-          function Strip-PromoControls([string]$text) {
+          function Strip-Xaml($text) {
             $t = $text
-
-            # 1) 删除自闭合控件：<Button ... />
-            $t = [regex]::Replace(
-              $t,
-              "(?is)<(Button|MenuItem|ToggleButton)\b[^>]*$kwRegex[^>]*/\s*>",
-              ""
-            )
-
-            # 2) 删除成对控件：<Button ...> ... </Button>
-            $t = [regex]::Replace(
-              $t,
-              "(?is)<(Button|MenuItem|ToggleButton)\b[^>]*$kwRegex[^>]*>.*?</\1>",
-              ""
-            )
-
-            # 3) 兜底：关键字在内部绑定/内容里
-            $t = [regex]::Replace(
-              $t,
-              "(?is)<(Button|MenuItem|ToggleButton)\b[^>]*>.*?$kwRegex.*?</\1>",
-              ""
-            )
-
+            $t = [regex]::Replace($t,'(?is)<(Button|MenuItem|ToggleButton)\b[^>]*$kwRegex[^>]*/\s*>','')
+            $t = [regex]::Replace($t,'(?is)<(Button|MenuItem|ToggleButton)\b[^>]*$kwRegex[^>]*>.*?</\1>','')
+            $t = [regex]::Replace($t,'(?is)<(Button|MenuItem|ToggleButton)\b[^>]*>.*?$kwRegex.*?</\1>','')
             return $t
           }
 
-          $changed = 0
-          foreach ($f in $xamlFiles) {
-            $s = Get-Content -Raw -Encoding UTF8 $f.FullName
-            $orig = $s
+          $changedXaml = 0
+          Get-ChildItem -Recurse -File -Include *.xaml |
+            Where-Object { $_.FullName -match '\\v2rayN\\' } |
+            ForEach-Object {
+              $s = Get-Content -Raw -Encoding UTF8 $_.FullName
+              if ($s -notmatch $kwRegex) { return }
+              $s2 = Strip-Xaml $s
+              if ($s2 -ne $s) {
+                Set-Content $_.FullName $s2 -Encoding UTF8
+                $changedXaml++
+              }
+            }
 
-            # 快速筛选：没关键字就跳过
-            if ($s -notmatch $kwRegex) { continue }
+          Write-Host "Changed XAML files: $changedXaml"
 
-            $s2 = Strip-PromoControls $s
-
-            if ($s2 -ne $orig) {
-              Set-Content -Path $f.FullName -Value $s2 -Encoding UTF8
-              Write-Host "✅ removed promo UI in $($f.FullName)"
-              $changed++
+          # ---------- 2. 处理 ResUI.zh-Hans.resx ----------
+          $resx = "v2rayN/ServiceLib/Resx/ResUI.zh-Hans.resx"
+          if (Test-Path $resx) {
+            $s = Get-Content -Raw -Encoding UTF8 $resx
+            $s2 = [regex]::Replace(
+              $s,
+              '(?s)(<data\s+name="Promote"[^>]*>\s*<value>).*?(</value>\s*</data>)',
+              '$1$2'
+            )
+            if ($s2 -ne $s) {
+              Set-Content $resx $s2 -Encoding UTF8
+              Write-Host "Cleared Promote value in resx"
             }
           }
 
-          Write-Host "Changed XAML files: $changed"
-
-          # ===== Guard：确保 UI 层不再出现推广入口（只检查 v2rayN 下的 XAML）=====
-          $hits = @()
+          # ---------- 3. Guard ----------
+          # XAML 里不允许再出现推广关键词
           foreach ($p in $kw) {
             $out = & git grep -n $p -- v2rayN -- '*.xaml' 2>$null
             if ($LASTEXITCODE -eq 0 -and $out) {
-              $hits += "❌ Found '$p' in XAML:`n$out"
+              Write-Error "Promo keyword '$p' still exists in XAML:`n$out"
+              exit 1
             }
           }
 
-          if ($hits.Count -gt 0) {
-            $hits | ForEach-Object { Write-Host $_ }
-            Write-Error "Promo entry still exists in XAML. Failing build."
+          # resx 中 Promote 必须是空 value
+          $check = & git grep -n '<value>推广</value>' -- $resx 2>$null
+          if ($LASTEXITCODE -eq 0 -and $check) {
+            Write-Error "Resx Promote value not cleared:`n$check"
             exit 1
           }
 
-          Write-Host "✅ Guard passed: no promo keywords in XAML"
+          Write-Host "Guard passed: promote fully removed"
 
       - name: Locate WPF csproj
         id: locate
@@ -188,10 +151,6 @@ jobs:
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
-            -p:PublishSingleFile=false `
-            -p:PublishTrimmed=false `
-            -p:DebugType=None `
-            -p:DebugSymbols=false `
             -o publish
 
       - name: Zip
