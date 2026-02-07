@@ -3,11 +3,18 @@ name: sync_and_build_windows
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: "Optional: custom release tag (leave empty to use v<version>-NoAds)"
+      force_build:
+        description: "Force build even if no upstream updates"
         required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "If set, create GitHub Release with this tag (e.g. v7.18.0-NoAds). If empty, use upstream version + -NoAds."
+        required: false
+        type: string
+        default: ""
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
 
 permissions:
   contents: write
@@ -45,30 +52,33 @@ jobs:
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { exit 1 }
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Upstream ahead by $behind commits"
 
-      - name: Exit if no upstream updates
-        if: steps.diff.outputs.behind == '0' && github.event_name != 'workflow_dispatch'
+      - name: Exit if no upstream updates (unless forced)
+        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
         shell: pwsh
-        run: exit 0
+        run: |
+          Write-Host "No upstream updates. Exit."
+          exit 0
 
       - name: Merge upstream & push
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
           $up = $upRef -replace '^refs/remotes/', ''
           git merge --no-edit $up
           git push origin HEAD
 
-      - name: Setup .NET
+      - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      # ===== 去广告（你已验证成功的版本，原样保留）=====
       - name: Locate MainWindow axaml & code-behind
         id: locate_mainwindow
         shell: pwsh
@@ -76,69 +86,185 @@ jobs:
           $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
             Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
             Select-Object -First 1
+          if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
+
           $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
             Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
             Select-Object -First 1
+          if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
+
           "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
           "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-      - name: Remove Promotion menu item (XAML) + Fix code-behind
+      - name: Remove Promotion menu item (XAML) + Fix code-behind references
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
           $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
+          # 1) 删除 XAML 里的 menuPromotion
           $x = Get-Content $axaml -Raw -Encoding UTF8
-          $x2 = [regex]::Replace($x,'(?m)^\s*<MenuItem\b[^>]*x:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?','')
-          if ($x2 -eq $x) { exit 1 }
+
+          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $x2 = [regex]::Replace($x, $patternLine, '')
+
+          if ($x2 -eq $x) {
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
+            $x2 = [regex]::Replace($x, $patternAny, '')
+          }
+
+          if ($x2 -eq $x) {
+            Write-Error "menuPromotion not removed from XAML (pattern not matched)."
+            exit 1
+          }
+
           Set-Content $axaml $x2 -Encoding UTF8
 
+          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
+          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
+            Write-Error "menuPromotion still exists in XAML after edit."
+            exit 1
+          }
+          Write-Host "✅ menuPromotion removed from XAML"
+
+          # 2) 删除 code-behind 里对 menuPromotion 的引用
           $c = Get-Content $cs -Raw -Encoding UTF8
-          $c2 = [regex]::Replace($c,'(?m)^\s*.*\bmenuPromotion\b.*\r?\n','')
-          Set-Content $cs $c2 -Encoding UTF8
+          $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
+          $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
 
-      # ===== 读取版本号（无奇怪缩进）=====
-      - name: Detect version
+          if ($c2 -ne $c) {
+            Set-Content $cs $c2 -Encoding UTF8
+            Write-Host "✅ menuPromotion references removed from code-behind"
+          } else {
+            Write-Host "ℹ️ No menuPromotion references removed (may not exist or pattern changed)"
+          }
+
+          $final = Get-Content $cs -Raw -Encoding UTF8
+          if ($final -match '\bmenuPromotion\b') {
+            Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
+            exit 1
+          }
+
+      - name: Detect version (upstream) + decide tag/title
         id: ver
-        shell: bash
-        run: |
-          cd v2rayN
-          VER="$(grep -oP '(?<=<Version>)[^<]+' Directory.Build.props | head -n 1)"
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          if [ -n "${{ inputs.release_tag }}" ]; then
-            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=v$VER-NoAds" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ===== 构建（完全复刻 upstream 结构，含 bin / AmazTool）=====
-      - name: Build (win-x64, upstream layout)
         shell: pwsh
         run: |
-          cd v2rayN
-          dotnet publish v2rayN.Desktop/v2rayN.Desktop.csproj `
+          $props = "v2rayN/Directory.Build.props"
+          if (!(Test-Path $props)) {
+            Write-Error "Directory.Build.props not found: $props"
+            exit 1
+          }
+
+          [xml]$xml = Get-Content $props
+          $ver = $xml.Project.PropertyGroup.Version
+          if (-not $ver) {
+            Write-Error "Version not found in Directory.Build.props"
+            exit 1
+          }
+
+          "version=$ver" | Out-File $env:GITHUB_OUTPUT -Append
+
+          $inputTag = "${{ inputs.release_tag }}"
+          if ($inputTag) {
+            $tag = $inputTag
+          } else {
+            $tag = "v$ver-NoAds"
+          }
+
+          "tag=$tag" | Out-File $env:GITHUB_OUTPUT -Append
+          "title=v2rayN $ver 去广告版 (NoAds)" | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "version=$ver"
+          Write-Host "tag=$tag"
+
+      - name: Build (win-x64, upstream layout) into release folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = Join-Path $env:GITHUB_WORKSPACE "v2rayN\Release\windows-64"
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          New-Item $out -ItemType Directory -Force | Out-Null
+
+          Push-Location v2rayN
+
+          dotnet publish .\v2rayN.Desktop\v2rayN.Desktop.csproj `
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
-            -p:PublishSingleFile=false `
-            -o ../release
+            -p:EnableWindowsTargeting=true `
+            -o $out
 
-      - name: Package release zip (full)
+          dotnet publish .\AmazTool\AmazTool.csproj `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -p:EnableWindowsTargeting=true `
+            -p:PublishTrimmed=true `
+            -o $out
+
+          Pop-Location
+
+      - name: Package release zip archive (full, include bin)
+        id: pack
         shell: pwsh
         run: |
-          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
-          New-Item dist -ItemType Directory | Out-Null
-          Compress-Archive -Path release\* -DestinationPath dist\v2rayN-windows-64-NoAds.zip
+          $ErrorActionPreference = "Stop"
 
-      - name: Upload artifact
+          $arch = "windows-64"
+          $out = Join-Path $env:GITHUB_WORKSPACE "v2rayN\Release\windows-64"
+
+          if (!(Test-Path $out)) {
+            Write-Error "Publish output not found: $out"
+            exit 1
+          }
+
+          # 使用上游脚本打包：会包含 bin/ 等必要结构（如果上游脚本存在）
+          $script = Join-Path $env:GITHUB_WORKSPACE "package-release-zip.sh"
+          if (!(Test-Path $script)) {
+            Write-Error "package-release-zip.sh not found in repo root."
+            exit 1
+          }
+
+          # Git-Bash 环境执行上游脚本
+          $bash = "C:\Program Files\Git\bin\bash.exe"
+          if (!(Test-Path $bash)) {
+            Write-Error "bash.exe not found at: $bash"
+            exit 1
+          }
+
+          & $bash "-lc" "chmod +x ./package-release-zip.sh && ./package-release-zip.sh $arch `"$out`""
+
+          $zipName = "v2rayN-$arch.zip"
+          if (!(Test-Path (Join-Path $env:GITHUB_WORKSPACE $zipName))) {
+            Write-Error "Zip not generated: $zipName"
+            exit 1
+          }
+
+          $finalZip = "v2rayN-$arch-NoAds.zip"
+          Move-Item (Join-Path $env:GITHUB_WORKSPACE $zipName) (Join-Path $env:GITHUB_WORKSPACE $finalZip) -Force
+
+          "zip=$finalZip" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "✅ Packed $finalZip"
+
+      - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayN-windows-64-NoAds.zip
-          path: dist/v2rayN-windows-64-NoAds.zip
+          name: v2rayN-windows-64-noads.zip
+          path: ${{ steps.pack.outputs.zip }}
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (optional)
+        if: ${{ steps.ver.outputs.tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.tag }}
-          files: dist/v2rayN-windows-64-NoAds.zip
+          name: ${{ steps.ver.outputs.title }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          files: |
+            ${{ steps.pack.outputs.zip }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
