@@ -1,0 +1,265 @@
+name: sync_and_build_windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Force build even if no upstream updates"
+        required: false
+        type: boolean
+        default: false
+      publish_release:
+        description: "Also publish to GitHub Release"
+        required: false
+        type: boolean
+        default: true
+      release_tag:
+        description: "Optional: specify tag (e.g. v7.18.0-NoAds). Leave empty to auto-detect upstream version + -NoAds"
+        required: false
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-build-windows
+  cancel-in-progress: true
+
+jobs:
+  sync_and_build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repo (with submodules)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: pwsh
+        run: |
+          git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
+          git fetch upstream --prune
+          git remote set-head upstream -a
+
+      - name: Detect upstream changes
+        id: diff
+        shell: pwsh
+        run: |
+          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
+          $up = $upRef -replace '^refs/remotes/', ''
+          $behind = git rev-list --count "HEAD..$up"
+          "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Upstream ahead by $behind commits"
+
+      - name: Exit if no upstream updates (unless forced)
+        if: steps.diff.outputs.behind == '0' && github.event_name == 'schedule'
+        shell: pwsh
+        run: |
+          Write-Host "No upstream updates (schedule run). Exit."
+          exit 0
+
+      - name: Exit if no upstream updates (manual run, unless forced)
+        if: steps.diff.outputs.behind == '0' && github.event_name == 'workflow_dispatch' && inputs.force_build != true
+        shell: pwsh
+        run: |
+          Write-Host "No upstream updates (manual run). Exit."
+          exit 0
+
+      - name: Merge upstream & push (only if changed)
+        if: steps.diff.outputs.behind != '0'
+        shell: pwsh
+        run: |
+          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
+          $up = $upRef -replace '^refs/remotes/', ''
+          git merge --no-edit $up
+          git push origin HEAD
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Locate MainWindow axaml & code-behind
+        id: locate_mainwindow
+        shell: pwsh
+        run: |
+          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
+            Select-Object -First 1
+          if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
+
+          $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
+            Select-Object -First 1
+          if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
+
+          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Remove Promotion menu item (XAML) + Fix code-behind references
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
+          $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
+
+          # 1) Remove menuPromotion from XAML
+          $x = Get-Content $axaml -Raw -Encoding UTF8
+
+          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $x2 = [regex]::Replace($x, $patternLine, '')
+
+          if ($x2 -eq $x) {
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
+            $x2 = [regex]::Replace($x, $patternAny, '')
+          }
+
+          if ($x2 -eq $x) {
+            Write-Error "menuPromotion not removed from XAML (pattern not matched)."
+            exit 1
+          }
+
+          Set-Content $axaml $x2 -Encoding UTF8
+
+          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
+          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
+            Write-Error "menuPromotion still exists in XAML after edit."
+            exit 1
+          }
+
+          Write-Host "✅ menuPromotion removed from XAML"
+
+          # 2) Remove menuPromotion references from code-behind
+          $c = Get-Content $cs -Raw -Encoding UTF8
+
+          # (a) remove any line containing menuPromotion
+          $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
+
+          # (b) defensive removal of nearby multi-line blocks
+          $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
+
+          if ($c2 -ne $c) {
+            Set-Content $cs $c2 -Encoding UTF8
+            Write-Host "✅ menuPromotion references removed from code-behind"
+          } else {
+            Write-Host "ℹ️ No menuPromotion references removed (may not exist or pattern changed)"
+          }
+
+          # Guard
+          $final = Get-Content $cs -Raw -Encoding UTF8
+          if ($final -match '\bmenuPromotion\b') {
+            Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
+            exit 1
+          }
+
+      - name: Detect upstream version (for tag/release name)
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candidates = @(
+            "v2rayN/Directory.Build.props",
+            "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj",
+            "v2rayN/ServiceLib/ServiceLib.csproj"
+          )
+
+          $ver = $null
+          foreach ($p in $candidates) {
+            if (Test-Path $p) {
+              $txt = Get-Content $p -Raw -Encoding UTF8
+              $m = [regex]::Match($txt, '<Version>\s*([^<\s]+)\s*</Version>')
+              if ($m.Success) { $ver = $m.Groups[1].Value; break }
+            }
+          }
+
+          if (-not $ver) {
+            Write-Error "Cannot detect <Version> from repo files."
+            exit 1
+          }
+
+          # input tag overrides; otherwise auto: v{ver}-NoAds
+          $inputTag = "${{ inputs.release_tag }}"
+          if ([string]::IsNullOrWhiteSpace($inputTag)) {
+            $tag = "v$ver-NoAds"
+          } else {
+            $tag = $inputTag.Trim()
+          }
+
+          "version=$ver" | Out-File $env:GITHUB_OUTPUT -Append
+          "tag=$tag"     | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Detected version: $ver"
+          Write-Host "Release tag: $tag"
+
+      - name: Locate v2rayN.Desktop.csproj
+        id: locate_csproj
+        shell: pwsh
+        run: |
+          $csproj = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
+          if (-not $csproj) { Write-Error "v2rayN.Desktop.csproj not found"; exit 1 }
+          "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore "${{ steps.locate_csproj.outputs.csproj }}"
+
+      - name: Publish (win-x64, self-contained)
+        shell: pwsh
+        run: |
+          if (Test-Path publish) { Remove-Item publish -Recurse -Force }
+          dotnet publish "${{ steps.locate_csproj.outputs.csproj }}" `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -o publish
+
+      - name: Zip artifact (NoAds)
+        id: pack
+        shell: pwsh
+        run: |
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          New-Item dist -ItemType Directory -Force | Out-Null
+
+          $zipName = "v2rayN-windows-64-noads.zip"
+          Compress-Archive -Path publish\* -DestinationPath ("dist\" + $zipName) -Force
+
+          "zip=dist/$zipName" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "✅ Packed: dist\$zipName"
+
+      - name: Upload artifact (zip only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2rayN-windows-64-noads.zip
+          path: ${{ steps.pack.outputs.zip }}
+
+      # ---- Publish to GitHub Release (manual only) ----
+      - name: Publish to GitHub Release (tag + assets)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: v2rayN ${{ steps.ver.outputs.version }} 去广告版 (NoAds)
+          body: |
+            - 上游版本：${{ steps.ver.outputs.version }}
+            - 构建：Windows x64 / self-contained
+            - 修改：移除菜单中的推广入口（menuPromotion）
+          files: |
+            ${{ steps.pack.outputs.zip }}
+          draft: false
+          prerelease: true
+          generate_release_notes: false
