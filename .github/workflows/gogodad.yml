@@ -1,197 +1,144 @@
-name: release Windows desktop x64 (NoAds)
+name: sync_and_build_windows
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (empty = auto v<upstreamVersion>)"
+        description: "Optional: custom release tag (leave empty to use v<version>-NoAds)"
         required: false
-        type: string
-        default: ""
-      publish_release:
-        description: "Publish to GitHub Release"
-        required: false
-        type: boolean
-        default: true
+  schedule:
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
 
-env:
-  OutputArch: "windows-64"
-  OutputPath64: "${{ github.workspace }}/v2rayN/Release/windows-64"
+concurrency:
+  group: sync-and-build-windows
+  cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  sync_and_build:
+    runs-on: windows-latest
 
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout repo (with submodules)
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
+          submodules: recursive
 
-      - name: Setup .NET 8
+      - name: Configure git
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: pwsh
+        run: |
+          git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
+          git fetch upstream --prune
+          git remote set-head upstream -a
+
+      - name: Detect upstream changes
+        id: diff
+        shell: pwsh
+        run: |
+          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          if (-not $upRef) { exit 1 }
+          $up = $upRef -replace '^refs/remotes/', ''
+          $behind = git rev-list --count "HEAD..$up"
+          "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Exit if no upstream updates
+        if: steps.diff.outputs.behind == '0' && github.event_name != 'workflow_dispatch'
+        shell: pwsh
+        run: exit 0
+
+      - name: Merge upstream & push
+        shell: pwsh
+        run: |
+          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
+          $up = $upRef -replace '^refs/remotes/', ''
+          git merge --no-edit $up
+          git push origin HEAD
+
+      - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
 
-      - name: Remove Promotion menu item (menuPromotion) - robust
-        shell: bash
+      # ===== 去广告（你已验证成功的版本，原样保留）=====
+      - name: Locate MainWindow axaml & code-behind
+        id: locate_mainwindow
+        shell: pwsh
         run: |
-          set -euo pipefail
+          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
+            Select-Object -First 1
+          $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
+            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
+            Select-Object -First 1
+          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-          AXAML="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml" | head -n 1 || true)"
-          CS="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml.cs" | head -n 1 || true)"
+      - name: Remove Promotion menu item (XAML) + Fix code-behind
+        shell: pwsh
+        run: |
+          $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
+          $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
-          if [ -z "${AXAML}" ]; then
-            echo "MainWindow.axaml not found" >&2
-            exit 1
-          fi
-          if [ -z "${CS}" ]; then
-            echo "MainWindow.axaml.cs not found" >&2
-            exit 1
-          fi
+          $x = Get-Content $axaml -Raw -Encoding UTF8
+          $x2 = [regex]::Replace($x,'(?m)^\s*<MenuItem\b[^>]*x:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?','')
+          if ($x2 -eq $x) { exit 1 }
+          Set-Content $axaml $x2 -Encoding UTF8
 
-          echo "AXAML=${AXAML}"
-          echo "CS=${CS}"
+          $c = Get-Content $cs -Raw -Encoding UTF8
+          $c2 = [regex]::Replace($c,'(?m)^\s*.*\bmenuPromotion\b.*\r?\n','')
+          Set-Content $cs $c2 -Encoding UTF8
 
-          cat > /tmp/remove_promo.py <<'PY'
-import re, sys
-from pathlib import Path
-
-axaml_path = Path(sys.argv[1])
-cs_path    = Path(sys.argv[2])
-
-x  = axaml_path.read_text(encoding="utf-8", errors="ignore")
-c  = cs_path.read_text(encoding="utf-8", errors="ignore")
-
-# 1) remove MenuItem x:Name="menuPromotion" in AXAML
-x2 = re.sub(r'(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?', '', x)
-if x2 == x:
-    x2 = re.sub(r'\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '', x)
-
-if x2 == x:
-    raise SystemExit("ERROR: menuPromotion not removed from XAML (pattern not matched).")
-
-if re.search(r'x:Name\s*=\s*"menuPromotion"', x2):
-    raise SystemExit("ERROR: menuPromotion still exists in XAML after edit.")
-
-axaml_path.write_text(x2, encoding="utf-8", newline="\n")
-
-# 2) remove any references in code-behind
-c2 = re.sub(r'(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '', c)
-c2 = re.sub(r'(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '', c2)
-
-cs_path.write_text(c2, encoding="utf-8", newline="\n")
-
-final = cs_path.read_text(encoding="utf-8", errors="ignore")
-if re.search(r'\bmenuPromotion\b', final):
-    raise SystemExit("ERROR: menuPromotion still referenced in MainWindow.axaml.cs after cleanup.")
-
-print("OK: menuPromotion removed from XAML + code-behind")
-PY
-
-          python3 /tmp/remove_promo.py "${AXAML}" "${CS}"
-
-      - name: Detect upstream version (for tag/title)
+      # ===== 读取版本号（无奇怪缩进）=====
+      - name: Detect version
         id: ver
         shell: bash
         run: |
-          set -euo pipefail
           cd v2rayN
-
-          VER="$(python3 - <<'PY'
-import re
-from pathlib import Path
-
-candidates = [
-  Path("Directory.Build.props"),
-  Path("v2rayN.Desktop/v2rayN.Desktop.csproj"),
-  Path("ServiceLib/ServiceLib.csproj"),
-]
-
-ver = None
-for p in candidates:
-    if p.exists():
-        s = p.read_text(encoding="utf-8", errors="ignore")
-        m = re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
-        if m:
-            ver = m.group(1).strip()
-            break
-
-if not ver:
-    raise SystemExit("Cannot find <Version> in props/csproj")
-
-print(ver)
-PY
-)"
+          VER="$(grep -oP '(?<=<Version>)[^<]+' Directory.Build.props | head -n 1)"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
-
           if [ -n "${{ inputs.release_tag }}" ]; then
             echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
+            echo "tag=v$VER-NoAds" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build (publish) x64 into upstream release folder (same style as upstream)
-        shell: bash
+      # ===== 构建（完全复刻 upstream 结构，含 bin / AmazTool）=====
+      - name: Build (win-x64, upstream layout)
+        shell: pwsh
         run: |
-          set -euo pipefail
           cd v2rayN
+          dotnet publish v2rayN.Desktop/v2rayN.Desktop.csproj `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -p:PublishSingleFile=false `
+            -o ../release
 
-          rm -rf "${OutputPath64}"
-          mkdir -p "${OutputPath64}"
-
-          # v2rayN Desktop
-          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj \
-            -c Release -r win-x64 \
-            -p:SelfContained=true -p:EnableWindowsTargeting=true \
-            -o "${OutputPath64}"
-
-          # AmazTool (required for upstream-style package contents)
-          dotnet publish ./AmazTool/AmazTool.csproj \
-            -c Release -r win-x64 \
-            -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true \
-            -o "${OutputPath64}"
-
-      - name: Upload raw publish folder (for debugging)
-        uses: actions/upload-artifact@v4
-        with:
-          name: v2rayN-windows-64-noads-raw
-          path: ${{ env.OutputPath64 }}
-
-      - name: Package release zip archive (same style as upstream; includes bin/ etc)
-        id: pack
-        shell: bash
+      - name: Package release zip (full)
+        shell: pwsh
         run: |
-          set -euo pipefail
-          chmod 755 package-release-zip.sh
-          ./package-release-zip.sh "${OutputArch}" "${OutputPath64}"
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          New-Item dist -ItemType Directory | Out-Null
+          Compress-Archive -Path release\* -DestinationPath dist\v2rayN-windows-64-NoAds.zip
 
-          # upstream produces: v2rayN-windows-64.zip
-          mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-NoAds.zip"
-          echo "zip=v2rayN-${OutputArch}-NoAds.zip" >> "$GITHUB_OUTPUT"
-
-      - name: Upload packaged zip artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayN-windows-64-noads.zip
-          path: ${{ steps.pack.outputs.zip }}
+          name: v2rayN-windows-64-NoAds.zip
+          path: dist/v2rayN-windows-64-NoAds.zip
 
-      - name: Publish zip to GitHub Release (optional)
-        if: inputs.publish_release == true
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: v2rayN ${{ steps.ver.outputs.version }} 去广告版
-          body: |
-            - 上游版本：${{ steps.ver.outputs.version }}
-            - 构建：Windows x64 / self-contained
-            - 打包：上游同款结构（包含 AmazTool、bin 等）
-            - 修改：移除菜单推广入口 menuPromotion
-          files: |
-            ${{ steps.pack.outputs.zip }}
-          prerelease: true
-          generate_release_notes: false
+          name: ${{ steps.ver.outputs.tag }}
+          files: dist/v2rayN-windows-64-NoAds.zip
