@@ -104,11 +104,8 @@ jobs:
           $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
           $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
-          # ----------------------------
           # 1) 删除 XAML 里的 menuPromotion
-          # ----------------------------
           $x = Get-Content $axaml -Raw -Encoding UTF8
-
           $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
           $x2 = [regex]::Replace($x, $patternLine, '')
 
@@ -132,16 +129,10 @@ jobs:
 
           Write-Host "✅ menuPromotion removed from XAML"
 
-          # --------------------------------------
           # 2) 删除 code-behind 里对 menuPromotion 的引用
-          #    必须用 (?m) 多行模式，否则 ^ 只能匹配文件开头
-          # --------------------------------------
           $c = Get-Content $cs -Raw -Encoding UTF8
 
-          # (a) 删“包含 menuPromotion 的整行”
           $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
-
-          # (b) 兜底：分多行绑定/初始化，删紧邻块
           $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
 
           if ($c2 -ne $c) {
@@ -151,7 +142,6 @@ jobs:
             Write-Host "ℹ️ No menuPromotion references removed (may not exist or pattern changed)"
           }
 
-          # Guard：只要还出现 menuPromotion 就失败（防回归）
           $final = Get-Content $cs -Raw -Encoding UTF8
           if ($final -match '\bmenuPromotion\b') {
             Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
@@ -209,7 +199,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # 这里用上游同款：发布到 v2rayN/Release/windows-64
           $out = Join-Path $env:GITHUB_WORKSPACE "v2rayN\Release\windows-64"
           if (Test-Path $out) { Remove-Item $out -Recurse -Force }
           New-Item $out -ItemType Directory -Force | Out-Null
@@ -223,7 +212,6 @@ jobs:
             -p:EnableWindowsTargeting=true `
             -o $out
 
-          # 上游包里会有 AmazTool.exe（你要的 A 开头那个）
           dotnet publish .\AmazTool\AmazTool.csproj `
             -c Release `
             -r win-x64 `
@@ -234,7 +222,6 @@ jobs:
 
           Pop-Location
 
-          # 简单校验：确保 AmazTool.exe 存在
           if (-not (Test-Path (Join-Path $out "AmazTool.exe"))) {
             Write-Error "AmazTool.exe not found in output folder. Packaging would be incomplete."
             exit 1
@@ -246,7 +233,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $tag = "${{ steps.ver.outputs.tag }}"
           $zipName = "v2rayN-windows-64-NoAds.zip"
 
           $releaseDir = Join-Path $env:GITHUB_WORKSPACE "v2rayN\Release\windows-64"
@@ -285,17 +271,17 @@ jobs:
           $tag   = "${{ steps.ver.outputs.tag }}"
           $title = "${{ steps.ver.outputs.title }}"
           $zip   = "${{ steps.pack.outputs.zip_path }}"
+          $asset = Split-Path $zip -Leaf
+
+          Write-Host "Repo: $repo"
+          Write-Host "Tag : $tag"
+          Write-Host "Asset: $asset"
 
           if (-not (Test-Path $zip)) { Write-Error "Zip not found: $zip"; exit 1 }
 
-          # 确保是对当前 fork 仓库操作
-          Write-Host "Repo: $repo"
-          Write-Host "Tag : $tag"
-
-          # Release notes（可自行改）
           $notes = "Auto-built from upstream with promotion menu removed.`n`n- Upstream version: ${{ steps.ver.outputs.version }}`n- Variant: NoAds"
 
-          # 如果 release 不存在则创建；存在则更新标题
+          # 1) release 不存在就创建，存在就更新
           gh release view $tag -R $repo *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag -R $repo -t "$title" -n "$notes" --prerelease
@@ -303,8 +289,9 @@ jobs:
             gh release edit $tag -R $repo -t "$title" -n "$notes"
           }
 
-          # 上传资源：用 --clobber 覆盖同名文件，避免 already_exists
+          # 2) 关键：先删同名资产（忽略失败），再上传，彻底避免 422 already exists
+          gh release delete-asset $tag $asset -R $repo -y *> $null
+
           gh release upload $tag -R $repo "$zip" --clobber
 
           Write-Host "✅ Release updated: $tag"
-
