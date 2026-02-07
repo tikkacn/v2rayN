@@ -255,17 +255,41 @@ jobs:
           name: v2rayN-windows-64-noads.zip
           path: ${{ steps.pack.outputs.zip }}
 
-      - name: Create or Update GitHub Release
+      - name: Create/Update GitHub Release (gh)
         if: ${{ steps.ver.outputs.tag != '' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.title }}
-          draft: false
-          prerelease: false
-          generate_release_notes: false
-          files: |
-            ${{ steps.pack.outputs.zip }}
-          fail_on_unmatched_files: true
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          TITLE: ${{ steps.ver.outputs.title }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          set -euo pipefail
+
+          echo "TAG=$TAG"
+          echo "TITLE=$TITLE"
+          echo "ZIP=$ZIP"
+
+          # 1) 若 release 不存在就创建；存在就跳过创建
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release exists: $TAG"
+          else
+            echo "Creating release: $TAG"
+            gh release create "$TAG" --title "$TITLE" --notes ""
+          fi
+
+          # 2) 删除同名旧资产（如果存在）
+          ASSET_NAME="$(basename "$ZIP")"
+          echo "ASSET_NAME=$ASSET_NAME"
+
+          # 尝试删除旧资产（不存在也不报错）
+          gh release delete-asset "$TAG" "$ASSET_NAME" -y >/dev/null 2>&1 || true
+
+          # 3) 上传新资产（覆盖/替换）
+          gh release upload "$TAG" "$ZIP" --clobber
+
+          # 4) 更新标题（确保带“去广告”字样）
+          gh release edit "$TAG" --title "$TITLE"
+
+          echo "✅ Release updated: $TAG"
+
