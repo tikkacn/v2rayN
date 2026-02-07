@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (leave empty = auto: v<upstreamVersion>-NoAds)"
+        description: "Release tag (empty = auto v<upstreamVersion>)"
         required: false
         type: string
         default: ""
@@ -42,7 +42,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # locate files (paths may shift slightly across versions)
           AXAML="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml" | head -n 1 || true)"
           CS="$(find . -type f -path "*/v2rayN.Desktop/Views/MainWindow.axaml.cs" | head -n 1 || true)"
 
@@ -58,7 +57,7 @@ jobs:
           echo "AXAML=${AXAML}"
           echo "CS=${CS}"
 
-          python3 - <<'PY' "$AXAML" "$CS"
+          cat > /tmp/remove_promo.py <<'PY'
 import re, sys
 from pathlib import Path
 
@@ -68,7 +67,7 @@ cs_path    = Path(sys.argv[2])
 x  = axaml_path.read_text(encoding="utf-8", errors="ignore")
 c  = cs_path.read_text(encoding="utf-8", errors="ignore")
 
-# ---- 1) remove MenuItem x:Name="menuPromotion" in AXAML ----
+# 1) remove MenuItem x:Name="menuPromotion" in AXAML
 x2 = re.sub(r'(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?', '', x)
 if x2 == x:
     x2 = re.sub(r'\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '', x)
@@ -81,7 +80,7 @@ if re.search(r'x:Name\s*=\s*"menuPromotion"', x2):
 
 axaml_path.write_text(x2, encoding="utf-8", newline="\n")
 
-# ---- 2) remove any references in code-behind ----
+# 2) remove any references in code-behind
 c2 = re.sub(r'(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '', c)
 c2 = re.sub(r'(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '', c2)
 
@@ -94,6 +93,8 @@ if re.search(r'\bmenuPromotion\b', final):
 print("OK: menuPromotion removed from XAML + code-behind")
 PY
 
+          python3 /tmp/remove_promo.py "${AXAML}" "${CS}"
+
       - name: Detect upstream version (for tag/title)
         id: ver
         shell: bash
@@ -101,7 +102,7 @@ PY
           set -euo pipefail
           cd v2rayN
 
-          python3 - <<'PY'
+          VER="$(python3 - <<'PY'
 import re
 from pathlib import Path
 
@@ -125,26 +126,13 @@ if not ver:
 
 print(ver)
 PY
-          VER="$(tail -n 1 <<<"$(python3 - <<'PY'
-import re
-from pathlib import Path
-candidates=[Path("Directory.Build.props"),Path("v2rayN.Desktop/v2rayN.Desktop.csproj"),Path("ServiceLib/ServiceLib.csproj")]
-ver=None
-for p in candidates:
-    if p.exists():
-        s=p.read_text(encoding="utf-8", errors="ignore")
-        m=re.search(r"<Version>\s*([^<\s]+)\s*</Version>", s)
-        if m: ver=m.group(1).strip(); break
-if not ver: raise SystemExit(1)
-print(ver)
-PY
-)")"
+)"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
           if [ -n "${{ inputs.release_tag }}" ]; then
             echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=v${VER}-NoAds" >> "$GITHUB_OUTPUT"
+            echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build (publish) x64 into upstream release folder (same style as upstream)
@@ -179,13 +167,11 @@ PY
         shell: bash
         run: |
           set -euo pipefail
-
           chmod 755 package-release-zip.sh
           ./package-release-zip.sh "${OutputArch}" "${OutputPath64}"
 
-          # upstream produces v2rayN-windows-64.zip
+          # upstream produces: v2rayN-windows-64.zip
           mv "v2rayN-${OutputArch}.zip" "v2rayN-${OutputArch}-NoAds.zip"
-
           echo "zip=v2rayN-${OutputArch}-NoAds.zip" >> "$GITHUB_OUTPUT"
 
       - name: Upload packaged zip artifact
@@ -199,11 +185,11 @@ PY
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
-          name: v2rayN ${{ steps.ver.outputs.version }} 去广告版 (NoAds)
+          name: v2rayN ${{ steps.ver.outputs.version }} 去广告版
           body: |
             - 上游版本：${{ steps.ver.outputs.version }}
             - 构建：Windows x64 / self-contained
-            - 内容：上游同款结构打包（包含 AmazTool、bin 等）
+            - 打包：上游同款结构（包含 AmazTool、bin 等）
             - 修改：移除菜单推广入口 menuPromotion
           files: |
             ${{ steps.pack.outputs.zip }}
