@@ -255,7 +255,7 @@ jobs:
           name: v2rayN-windows-64-noads.zip
           path: ${{ steps.pack.outputs.zip }}
 
-      - name: Create GitHub Release (optional)
+      - name: Create or Update GitHub Release
         if: ${{ steps.ver.outputs.tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
@@ -266,5 +266,6 @@ jobs:
           generate_release_notes: false
           files: |
             ${{ steps.pack.outputs.zip }}
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
