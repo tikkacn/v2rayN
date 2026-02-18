@@ -5,14 +5,14 @@ on:
     inputs:
       force_build:
         description: "Force build even if no upstream updates"
-        type: boolean
-        default: false
+        required: false
+        default: "false"
       release_tag:
-        description: "If set, use this tag for Release (e.g. v7.18.0-NoAds). Leave empty to auto-generate."
-        type: string
+        description: "If set, use this tag for Release (e.g. v7.18.0-NoAds). Leave empty to auto tag."
+        required: false
         default: ""
   schedule:
-    - cron: "0 */6 * * *" # every 6 hours (UTC)
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -50,14 +50,14 @@ jobs:
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
+          if (-not $upRef) { throw "Cannot resolve upstream HEAD" }
           $up = $upRef -replace '^refs/remotes/', ''
           $behind = git rev-list --count "HEAD..$up"
           "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
           Write-Host "Upstream ahead by $behind commits"
 
       - name: Exit if no upstream updates (unless forced)
-        if: steps.diff.outputs.behind == '0' && inputs.force_build != true
+        if: steps.diff.outputs.behind == '0' && github.event.inputs.force_build != 'true'
         shell: pwsh
         run: |
           Write-Host "No upstream updates. Exit."
@@ -67,7 +67,7 @@ jobs:
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { Write-Error "Cannot resolve upstream HEAD"; exit 1 }
+          if (-not $upRef) { throw "Cannot resolve upstream HEAD" }
           $up = $upRef -replace '^refs/remotes/', ''
           git merge --no-edit $up
           git push origin HEAD
@@ -84,17 +84,17 @@ jobs:
           $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
             Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
             Select-Object -First 1
-          if (-not $axaml) { Write-Error "MainWindow.axaml not found"; exit 1 }
+          if (-not $axaml) { throw "MainWindow.axaml not found" }
 
           $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
             Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
             Select-Object -First 1
-          if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
+          if (-not $cs) { throw "MainWindow.axaml.cs not found" }
 
           "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
           "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-      - name: Remove Promotion menu item (menuPromotion) from XAML + code-behind (robust) + Guard
+      - name: Remove Promotion menu item (XAML) + Fix code-behind references (robust) + Guard
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -102,235 +102,193 @@ jobs:
           $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
           $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
-          # --- 1) Remove menuPromotion MenuItem in XAML (self-closing or normal) ---
+          # 1) remove menuPromotion in XAML
           $x = Get-Content $axaml -Raw -Encoding UTF8
 
           $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
           $x2 = [regex]::Replace($x, $patternLine, '')
 
           if ($x2 -eq $x) {
-            # defensive: non-self-closing block
-            $patternBlock = '(?ms)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>\s*\r?\n?'
-            $x2 = [regex]::Replace($x, $patternBlock, '')
-          }
-
-          if ($x2 -eq $x) {
-            # last resort: remove any tag that contains x:Name="menuPromotion"
-            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>\s*'
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
             $x2 = [regex]::Replace($x, $patternAny, '')
           }
 
-          if ($x2 -eq $x) {
-            Write-Error "menuPromotion not removed from XAML (pattern not matched)."
-            exit 1
-          }
+          if ($x2 -eq $x) { throw "menuPromotion not removed from XAML (pattern not matched)" }
 
-          Set-Content $axaml $x2 -Encoding UTF8
+          Set-Content -Path $axaml -Value $x2 -Encoding UTF8
 
           $xCheck = Get-Content $axaml -Raw -Encoding UTF8
-          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
-            Write-Error "menuPromotion still exists in XAML after edit."
-            exit 1
-          }
+          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') { throw "menuPromotion still exists in XAML after edit" }
 
-          Write-Host "✅ menuPromotion removed from XAML"
-
-          # --- 2) Remove menuPromotion references in code-behind ---
+          # 2) remove menuPromotion references in code-behind
           $c = Get-Content $cs -Raw -Encoding UTF8
-
-          # remove any full line containing menuPromotion
           $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
-
-          # defensive: remove small blocks around menuPromotion usage
           $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
 
           if ($c2 -ne $c) {
-            Set-Content $cs $c2 -Encoding UTF8
-            Write-Host "✅ menuPromotion references removed from code-behind"
-          } else {
-            Write-Host "ℹ️ No menuPromotion references removed (may not exist)"
+            Set-Content -Path $cs -Value $c2 -Encoding UTF8
           }
 
           $final = Get-Content $cs -Raw -Encoding UTF8
-          if ($final -match '\bmenuPromotion\b') {
-            Write-Error "menuPromotion still referenced in MainWindow.axaml.cs after cleanup."
-            exit 1
-          }
+          if ($final -match '\bmenuPromotion\b') { throw "menuPromotion still referenced in MainWindow.axaml.cs after cleanup" }
 
-      - name: Locate csproj (Desktop + AmazTool)
-        id: locate_projects
-        shell: pwsh
-        run: |
-          $desktop = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
-          if (-not $desktop) { Write-Error "v2rayN.Desktop.csproj not found"; exit 1 }
-
-          $amaz = Get-ChildItem -Recurse -File -Filter "AmazTool.csproj" | Select-Object -First 1
-          if (-not $amaz) { Write-Error "AmazTool.csproj not found"; exit 1 }
-
-          "desktop=$($desktop.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          "amaz=$($amaz.FullName)"       | Out-File $env:GITHUB_OUTPUT -Append
-
-      - name: Detect upstream version + decide tag/title
+      - name: Detect upstream version (safe, no grep -P)
         id: ver
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Try to read <Version> from common files
-          $candidates = @(
-            "v2rayN/Directory.Build.props",
-            "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj",
-            "v2rayN/ServiceLib/ServiceLib.csproj"
-          )
+          # Try to read <Version> from v2rayN/Directory.Build.props first
+          $props = "v2rayN/Directory.Build.props"
+          $version = ""
 
-          $version = $null
-          foreach ($p in $candidates) {
-            if (Test-Path $p) {
-              $m = Select-String -Path $p -Pattern '<Version>\s*([^<]+)\s*</Version>' -AllMatches
-              if ($m.Matches.Count -gt 0) {
-                $version = $m.Matches[0].Groups[1].Value.Trim()
-                break
-              }
+          if (Test-Path $props) {
+            [xml]$xml = Get-Content $props -Raw
+            $v = $xml.Project.PropertyGroup.Version | Select-Object -First 1
+            if ($v) { $version = $v.Trim() }
+          }
+
+          if (-not $version) {
+            # fallback: read from v2rayN.Desktop.csproj if needed
+            $csproj = "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"
+            if (Test-Path $csproj) {
+              [xml]$xml2 = Get-Content $csproj -Raw
+              $v2 = $xml2.Project.PropertyGroup.Version | Select-Object -First 1
+              if ($v2) { $version = $v2.Trim() }
             }
           }
 
-          if (-not $version) { Write-Error "Cannot find <Version> in props/csproj"; exit 1 }
-
-          $tag = "${{ inputs.release_tag }}"
-          if ([string]::IsNullOrWhiteSpace($tag)) {
-            $tag = "v$version-NoAds"
-          }
-
-          $title = "v2rayN $version 去广告版 (NoAds)"
+          if (-not $version) { throw "Cannot find Version in Directory.Build.props or csproj" }
 
           "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
-          "tag=$tag"         | Out-File $env:GITHUB_OUTPUT -Append
-          "title=$title"     | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Detected version: $version"
 
-          Write-Host "Version: $version"
-          Write-Host "Tag:     $tag"
-          Write-Host "Title:   $title"
-
-      - name: Restore
+      - name: Restore & Publish v2rayN Desktop (win-x64, self-contained)
         shell: pwsh
         run: |
-          dotnet restore "${{ steps.locate_projects.outputs.desktop }}"
-          dotnet restore "${{ steps.locate_projects.outputs.amaz }}"
-
-      - name: Publish v2rayN Desktop (win-x64, self-contained)
-        shell: pwsh
-        run: |
-          if (Test-Path out) { Remove-Item out -Recurse -Force }
-          New-Item out -ItemType Directory -Force | Out-Null
-
-          dotnet publish "${{ steps.locate_projects.outputs.desktop }}" `
+          dotnet restore "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj"
+          dotnet publish "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj" `
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
-            -o out\app
+            -o out\desktop
 
-      - name: Publish AmazTool (win-x64, self-contained)
+      - name: Restore & Publish AmazTool (win-x64, self-contained)
         shell: pwsh
         run: |
-          dotnet publish "${{ steps.locate_projects.outputs.amaz }}" `
-            -c Release `
-            -r win-x64 `
-            -p:SelfContained=true `
-            -o out\amaz
+          if (Test-Path "v2rayN/AmazTool/AmazTool.csproj") {
+            dotnet restore "v2rayN/AmazTool/AmazTool.csproj"
+            dotnet publish "v2rayN/AmazTool/AmazTool.csproj" `
+              -c Release `
+              -r win-x64 `
+              -p:SelfContained=true `
+              -o out\amaz
+          } else {
+            Write-Host "AmazTool.csproj not found; skip AmazTool build."
+          }
 
-      - name: Assemble release folder (ensure AmazTool + bin)
+      - name: Download upstream official zip & extract bin (via gh, no guessing URL)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ver = "${{ steps.ver.outputs.version }}"
+          $upRepo = "2dust/v2rayN"
+          $upTag  = "v$ver"
+
+          # Query assets list, pick a windows-64 zip that is NOT source code
+          $assetsJson = gh release view $upTag -R $upRepo --json assets
+          if ($LASTEXITCODE -ne 0) { throw "Cannot view upstream release $upTag" }
+
+          $assets = ($assetsJson | ConvertFrom-Json).assets
+          $asset = $assets |
+            Where-Object { $_.name -match 'windows-64.*\.zip$' -and $_.name -notmatch 'Source code' } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            # fallback: sometimes named v2rayN-windows-64.zip
+            $asset = $assets | Where-Object { $_.name -eq "v2rayN-windows-64.zip" } | Select-Object -First 1
+          }
+
+          if (-not $asset) {
+            $names = ($assets | ForEach-Object { $_.name }) -join ", "
+            throw "Cannot find upstream windows-64 zip asset in $upTag. Assets: $names"
+          }
+
+          if (Test-Path upstream) { Remove-Item upstream -Recurse -Force }
+          New-Item upstream -ItemType Directory -Force | Out-Null
+
+          gh release download $upTag -R $upRepo -p $asset.name -D upstream
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download upstream asset: $($asset.name)" }
+
+          $zipPath = Join-Path "upstream" $asset.name
+          if (-not (Test-Path $zipPath)) { throw "Downloaded zip not found: $zipPath" }
+
+          if (Test-Path upstream_extracted) { Remove-Item upstream_extracted -Recurse -Force }
+          Expand-Archive -Path $zipPath -DestinationPath upstream_extracted -Force
+
+          # Upstream zip usually contains bin/ at root
+          if (-not (Test-Path "upstream_extracted\bin")) {
+            # Some zips have one top folder; try to locate bin anywhere
+            $bin = Get-ChildItem -Path upstream_extracted -Recurse -Directory -Filter "bin" | Select-Object -First 1
+            if ($bin) {
+              New-Item -ItemType Directory -Force -Path upstream_extracted\bin_found | Out-Null
+              Copy-Item $bin.FullName upstream_extracted\bin_found -Recurse -Force
+            } else {
+              throw "Upstream zip extracted but bin/ not found."
+            }
+          }
+
+      - name: Assemble release folder (include AmazTool + bin)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $release = "out\release"
-          if (Test-Path $release) { Remove-Item $release -Recurse -Force }
-          New-Item $release -ItemType Directory -Force | Out-Null
+          if (Test-Path release) { Remove-Item release -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
 
-          # 1) Copy app output
-          Copy-Item "out\app\*" $release -Recurse -Force
+          # desktop publish
+          Copy-Item out\desktop\* release\ -Recurse -Force
 
-          # 2) Copy AmazTool artifacts into root (only AmazTool* files to avoid collisions)
-          Get-ChildItem "out\amaz" -File | ForEach-Object {
-            if ($_.Name -like "AmazTool*") {
-              Copy-Item $_.FullName $release -Force
-            }
+          # AmazTool.exe
+          if (Test-Path out\amaz\AmazTool.exe) {
+            Copy-Item out\amaz\AmazTool.exe release\ -Force
           }
 
-          # 3) Ensure bin folder exists. If missing, pull it from upstream release zip of same version.
-          $binPath = Join-Path $release "bin"
-          if (-not (Test-Path $binPath)) {
-            Write-Host "⚠️ bin folder not found in build output. Try to fetch from upstream release zip..."
-
-            $ver = "${{ steps.ver.outputs.version }}"
-            $tmp = "out\upstream"
-            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-            New-Item $tmp -ItemType Directory -Force | Out-Null
-
-            $urls = @(
-              "https://github.com/2dust/v2rayN/releases/download/v$ver/v2rayN-windows-64.zip",
-              "https://github.com/2dust/v2rayN/releases/download/v$ver/v2rayN-windows-64.zip.zip"
-            )
-
-            $zip = Join-Path $tmp "upstream.zip"
-            $downloaded = $false
-            foreach ($u in $urls) {
-              try {
-                Write-Host "Downloading: $u"
-                Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing
-                if ((Get-Item $zip).Length -gt 1024) { $downloaded = $true; break }
-              } catch {
-                Write-Host "Download failed: $u"
-              }
-            }
-
-            if ($downloaded) {
-              Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp "x") -Force
-              $foundBin = Get-ChildItem (Join-Path $tmp "x") -Directory -Recurse | Where-Object { $_.Name -ieq "bin" } | Select-Object -First 1
-              if ($foundBin) {
-                Copy-Item $foundBin.FullName $binPath -Recurse -Force
-                Write-Host "✅ bin folder copied from upstream zip."
-              } else {
-                Write-Host "⚠️ Upstream zip extracted but bin folder not found."
-              }
-            } else {
-              Write-Host "⚠️ Could not download upstream zip; continuing without bin."
-            }
+          # bin folder from upstream
+          if (Test-Path upstream_extracted\bin) {
+            Copy-Item upstream_extracted\bin release\bin -Recurse -Force
+          } elseif (Test-Path upstream_extracted\bin_found\bin) {
+            Copy-Item upstream_extracted\bin_found\bin release\bin -Recurse -Force
           } else {
-            Write-Host "✅ bin folder already present."
-          }
-
-          # 4) Guard: ensure AmazTool.exe exists in final folder
-          if (-not (Test-Path (Join-Path $release "AmazTool.exe"))) {
-            Write-Error "AmazTool.exe not found in final release folder."
-            exit 1
+            throw "bin not found after upstream extraction."
           }
 
       - name: Package release zip (single full zip)
         id: pack
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
-          New-Item dist -ItemType Directory -Force | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
 
-          $zipName = "v2rayN-windows-64-NoAds.zip"
-          $zipPath = Join-Path "dist" $zipName
+          $zip = "dist\v2rayN-windows-64-NoAds.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
 
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path "out\release\*" -DestinationPath $zipPath -Force
+          Compress-Archive -Path release\* -DestinationPath $zip -Force
 
-          "zip_name=$zipName" | Out-File $env:GITHUB_OUTPUT -Append
-          "zip_path=$zipPath" | Out-File $env:GITHUB_OUTPUT -Append
+          "zip=$zip" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "ZIP: $zip"
 
-          Write-Host "✅ ZIP: $zipPath"
-
-      - name: Upload artifact (zip)
+      - name: Upload artifact (single zip)
         uses: actions/upload-artifact@v4
         with:
           name: v2rayN-windows-64-NoAds.zip
-          path: dist/v2rayN-windows-64-NoAds.zip
+          path: ${{ steps.pack.outputs.zip }}
 
-      - name: Create/Update GitHub Release (single full zip)
+      - name: Create/Update GitHub Release (single full zip, delete old asset to avoid 422)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -338,42 +296,43 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $repo  = "${{ github.repository }}"
-          $tag   = "${{ steps.ver.outputs.tag }}"
-          $title = "${{ steps.ver.outputs.title }}"
-          $zip   = "${{ steps.pack.outputs.zip_path }}"
-          $asset = "${{ steps.pack.outputs.zip_name }}"
           $ver   = "${{ steps.ver.outputs.version }}"
 
-          Write-Host "Repo:  $repo"
-          Write-Host "Tag:   $tag"
-          Write-Host "Title: $title"
-          Write-Host "Asset: $asset"
-          Write-Host "Zip:   $zip"
+          if ("${{ github.event.inputs.release_tag }}".Trim()) {
+            $tag = "${{ github.event.inputs.release_tag }}".Trim()
+          } else {
+            $tag = "v$ver-NoAds"
+          }
 
-          # build notes WITHOUT here-string (to avoid ANY indentation issues)
+          $title = "v2rayN $ver 去广告版 (NoAds)"
+          $zip   = "${{ steps.pack.outputs.zip }}"
+          $asset = "v2rayN-windows-64-NoAds.zip"
+
+          # notes: no here-string, no YAML indent traps
           $notesLines = @(
             "Auto-built from upstream with promotion menu removed.",
             "",
             "- Upstream version: $ver",
             "- Variant: NoAds",
-            "- Build: win-x64, self-contained",
-            ""
+            "- Platform: win-x64, self-contained",
+            "- Included: AmazTool.exe + bin/"
           )
-          $notes = ($notesLines -join "`n")
+          $notes = $notesLines -join "`n"
 
-          # check if release exists
-          $exists = $true
-          gh release view $tag --repo $repo *> $null
-          if ($LASTEXITCODE -ne 0) { $exists = $false }
-
-          if (-not $exists) {
-            gh release create $tag --repo $repo --title "$title" --notes "$notes" --prerelease
+          gh release view $tag -R $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag -R $repo --title $title --notes $notes --prerelease
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag" }
           } else {
-            gh release edit $tag --repo $repo --title "$title" --notes "$notes" --prerelease
+            gh release edit $tag -R $repo --title $title --notes $notes --prerelease
+            if ($LASTEXITCODE -ne 0) { throw "Failed to edit release $tag" }
           }
 
-          # delete old asset if exists, then upload (prevents 422 already exists)
-          gh release delete-asset $tag $asset --repo $repo --yes 2>$null
-          gh release upload $tag $zip --repo $repo --clobber
+          # delete old asset if exists -> avoid 422
+          gh release delete-asset $tag $asset -R $repo --yes 2>$null
 
-          Write-Host "✅ Release updated: https://github.com/$repo/releases/tag/$tag"
+          # upload
+          gh release upload $tag $zip -R $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload asset to release $tag" }
+
+          Write-Host "Release updated: https://github.com/$repo/releases/tag/$tag"
