@@ -5,14 +5,12 @@ on:
     inputs:
       force_build:
         description: "Force build even if no upstream updates"
-        required: false
-        default: false
         type: boolean
+        default: false
       release_tag:
-        description: "If set, create/update GitHub Release with this tag (e.g. v7.18.0). Leave empty to use upstream version."
-        required: false
-        default: ""
+        description: "If set, use this tag for Release (e.g. v7.18.0-NoAds). Leave empty to auto-generate."
         type: string
+        default: ""
   schedule:
     - cron: "0 */6 * * *" # every 6 hours (UTC)
 
@@ -37,7 +35,7 @@ jobs:
       - name: Configure git
         shell: pwsh
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Fetch upstream
@@ -79,9 +77,6 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # -----------------------------
-      # Locate MainWindow.axaml & code-behind robustly
-      # -----------------------------
       - name: Locate MainWindow axaml & code-behind
         id: locate_mainwindow
         shell: pwsh
@@ -97,11 +92,8 @@ jobs:
           if (-not $cs) { Write-Error "MainWindow.axaml.cs not found"; exit 1 }
 
           "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          "cs=$($cs.FullName)"       | Out-File $env:GITHUB_OUTPUT -Append
+          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-      # -----------------------------
-      # Remove Promotion menu item (menuPromotion) from XAML + code-behind
-      # -----------------------------
       - name: Remove Promotion menu item (menuPromotion) from XAML + code-behind (robust) + Guard
         shell: pwsh
         run: |
@@ -110,23 +102,22 @@ jobs:
           $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
           $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
-          # 1) Remove <MenuItem ... x:Name="menuPromotion" .../> or paired tag block
+          # --- 1) Remove menuPromotion MenuItem in XAML (self-closing or normal) ---
           $x = Get-Content $axaml -Raw -Encoding UTF8
 
-          # self-closing line
-          $pat1 = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          $x2 = [regex]::Replace($x, $pat1, '')
+          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
+          $x2 = [regex]::Replace($x, $patternLine, '')
 
-          # paired tag block (defensive)
           if ($x2 -eq $x) {
-            $pat2 = '(?ms)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>\s*\r?\n?'
-            $x2 = [regex]::Replace($x, $pat2, '')
+            # defensive: non-self-closing block
+            $patternBlock = '(?ms)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>.*?</MenuItem>\s*\r?\n?'
+            $x2 = [regex]::Replace($x, $patternBlock, '')
           }
 
-          # ultra fallback: remove any menu item containing menuPromotion
           if ($x2 -eq $x) {
-            $pat3 = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*(?:/>\s*|>.*?</MenuItem>\s*)'
-            $x2 = [regex]::Replace($x, $pat3, '')
+            # last resort: remove any tag that contains x:Name="menuPromotion"
+            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*>\s*'
+            $x2 = [regex]::Replace($x, $patternAny, '')
           }
 
           if ($x2 -eq $x) {
@@ -134,29 +125,30 @@ jobs:
             exit 1
           }
 
-          Set-Content -Path $axaml -Value $x2 -Encoding UTF8
+          Set-Content $axaml $x2 -Encoding UTF8
 
-          $check = Get-Content $axaml -Raw -Encoding UTF8
-          if ($check -match 'x:Name\s*=\s*"menuPromotion"') {
+          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
+          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') {
             Write-Error "menuPromotion still exists in XAML after edit."
             exit 1
           }
+
           Write-Host "✅ menuPromotion removed from XAML"
 
-          # 2) Remove any references to menuPromotion in code-behind
+          # --- 2) Remove menuPromotion references in code-behind ---
           $c = Get-Content $cs -Raw -Encoding UTF8
 
-          # remove any line containing menuPromotion
+          # remove any full line containing menuPromotion
           $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
 
-          # defensive: remove small block around it (covers multi-line event hookup)
+          # defensive: remove small blocks around menuPromotion usage
           $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
 
           if ($c2 -ne $c) {
-            Set-Content -Path $cs -Value $c2 -Encoding UTF8
+            Set-Content $cs $c2 -Encoding UTF8
             Write-Host "✅ menuPromotion references removed from code-behind"
           } else {
-            Write-Host "ℹ️ No menuPromotion references removed (pattern may have changed, but XAML was removed)"
+            Write-Host "ℹ️ No menuPromotion references removed (may not exist)"
           }
 
           $final = Get-Content $cs -Raw -Encoding UTF8
@@ -165,120 +157,172 @@ jobs:
             exit 1
           }
 
-      # -----------------------------
-      # Detect upstream version and decide tag/title
-      # -----------------------------
-      - name: Detect version (upstream) + decide tag/title
+      - name: Locate csproj (Desktop + AmazTool)
+        id: locate_projects
+        shell: pwsh
+        run: |
+          $desktop = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
+          if (-not $desktop) { Write-Error "v2rayN.Desktop.csproj not found"; exit 1 }
+
+          $amaz = Get-ChildItem -Recurse -File -Filter "AmazTool.csproj" | Select-Object -First 1
+          if (-not $amaz) { Write-Error "AmazTool.csproj not found"; exit 1 }
+
+          "desktop=$($desktop.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          "amaz=$($amaz.FullName)"       | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Detect upstream version + decide tag/title
         id: ver
         shell: pwsh
         run: |
-          function Get-VersionFromFile($path) {
-            if (-not (Test-Path $path)) { return $null }
-            $txt = Get-Content $path -Raw -Encoding UTF8
-            $m = [regex]::Match($txt, '<Version>\s*([^<\s]+)\s*</Version>')
-            if ($m.Success) { return $m.Groups[1].Value.Trim() }
-            return $null
-          }
+          $ErrorActionPreference = "Stop"
 
+          # Try to read <Version> from common files
           $candidates = @(
             "v2rayN/Directory.Build.props",
             "v2rayN/v2rayN.Desktop/v2rayN.Desktop.csproj",
             "v2rayN/ServiceLib/ServiceLib.csproj"
           )
 
-          $v = $null
+          $version = $null
           foreach ($p in $candidates) {
-            $v = Get-VersionFromFile $p
-            if ($v) { break }
+            if (Test-Path $p) {
+              $m = Select-String -Path $p -Pattern '<Version>\s*([^<]+)\s*</Version>' -AllMatches
+              if ($m.Matches.Count -gt 0) {
+                $version = $m.Matches[0].Groups[1].Value.Trim()
+                break
+              }
+            }
           }
-          if (-not $v) { Write-Error "Cannot find <Version> in props/csproj"; exit 1 }
+
+          if (-not $version) { Write-Error "Cannot find <Version> in props/csproj"; exit 1 }
 
           $tag = "${{ inputs.release_tag }}"
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "v$v" }
-          $tagNoAds = "$tag-NoAds"
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = "v$version-NoAds"
+          }
 
-          $title = "v2rayN $v 去广告版 (NoAds)"
+          $title = "v2rayN $version 去广告版 (NoAds)"
 
-          "version=$v"       | Out-File $env:GITHUB_OUTPUT -Append
-          "tag=$tagNoAds"    | Out-File $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
+          "tag=$tag"         | Out-File $env:GITHUB_OUTPUT -Append
           "title=$title"     | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host "Version: $v"
-          Write-Host "Tag: $tagNoAds"
-          Write-Host "Title: $title"
+          Write-Host "Version: $version"
+          Write-Host "Tag:     $tag"
+          Write-Host "Title:   $title"
 
-      # -----------------------------
-      # Build (win-x64) into an "upstream-like" release folder
-      # -----------------------------
-      - name: Build (win-x64, upstream layout) into release folder
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore "${{ steps.locate_projects.outputs.desktop }}"
+          dotnet restore "${{ steps.locate_projects.outputs.amaz }}"
+
+      - name: Publish v2rayN Desktop (win-x64, self-contained)
+        shell: pwsh
+        run: |
+          if (Test-Path out) { Remove-Item out -Recurse -Force }
+          New-Item out -ItemType Directory -Force | Out-Null
+
+          dotnet publish "${{ steps.locate_projects.outputs.desktop }}" `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -o out\app
+
+      - name: Publish AmazTool (win-x64, self-contained)
+        shell: pwsh
+        run: |
+          dotnet publish "${{ steps.locate_projects.outputs.amaz }}" `
+            -c Release `
+            -r win-x64 `
+            -p:SelfContained=true `
+            -o out\amaz
+
+      - name: Assemble release folder (ensure AmazTool + bin)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Set-Location v2rayN
 
-          $out = Join-Path $PWD "Release/windows-64"
-          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-          New-Item $out -ItemType Directory -Force | Out-Null
+          $release = "out\release"
+          if (Test-Path $release) { Remove-Item $release -Recurse -Force }
+          New-Item $release -ItemType Directory -Force | Out-Null
 
-          dotnet publish ./v2rayN.Desktop/v2rayN.Desktop.csproj -c Release -r win-x64 -p:SelfContained=true -p:EnableWindowsTargeting=true -o $out
-          dotnet publish ./AmazTool/AmazTool.csproj             -c Release -r win-x64 -p:SelfContained=true -p:EnableWindowsTargeting=true -p:PublishTrimmed=true -o $out
+          # 1) Copy app output
+          Copy-Item "out\app\*" $release -Recurse -Force
 
-          # Try to copy the "real" bin folder (core binaries) into output
-          # We search for a bin folder that contains typical core files (xray/sing-box/geoip/geosite).
-          $repoRoot = $PWD
-          $binCandidates = Get-ChildItem -Path $repoRoot -Directory -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ieq "bin" } |
-            ForEach-Object {
-              $files = @("xray.exe","sing-box.exe","v2ray.exe","geoip.dat","geosite.dat")
-              $hit = $false
-              foreach ($f in $files) {
-                if (Test-Path (Join-Path $_.FullName $f)) { $hit = $true; break }
-              }
-              if ($hit) { $_ }
-            } |
-            Select-Object -First 1
-
-          if ($binCandidates) {
-            $dstBin = Join-Path $out "bin"
-            Copy-Item -Path $binCandidates.FullName -Destination $dstBin -Recurse -Force
-            Write-Host "✅ Copied core bin folder: $($binCandidates.FullName) -> $dstBin"
-          } else {
-            Write-Host "⚠️ Could not locate core bin folder in repo. If upstream uses downloaded cores, you may need to add a step to fetch cores."
+          # 2) Copy AmazTool artifacts into root (only AmazTool* files to avoid collisions)
+          Get-ChildItem "out\amaz" -File | ForEach-Object {
+            if ($_.Name -like "AmazTool*") {
+              Copy-Item $_.FullName $release -Force
+            }
           }
 
-          # Guards: ensure AmazTool exists, and warn if bin is missing
-          if (-not (Test-Path (Join-Path $out "AmazTool.exe"))) {
-            Write-Error "AmazTool.exe not found in output. Build/package is incomplete."
+          # 3) Ensure bin folder exists. If missing, pull it from upstream release zip of same version.
+          $binPath = Join-Path $release "bin"
+          if (-not (Test-Path $binPath)) {
+            Write-Host "⚠️ bin folder not found in build output. Try to fetch from upstream release zip..."
+
+            $ver = "${{ steps.ver.outputs.version }}"
+            $tmp = "out\upstream"
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            New-Item $tmp -ItemType Directory -Force | Out-Null
+
+            $urls = @(
+              "https://github.com/2dust/v2rayN/releases/download/v$ver/v2rayN-windows-64.zip",
+              "https://github.com/2dust/v2rayN/releases/download/v$ver/v2rayN-windows-64.zip.zip"
+            )
+
+            $zip = Join-Path $tmp "upstream.zip"
+            $downloaded = $false
+            foreach ($u in $urls) {
+              try {
+                Write-Host "Downloading: $u"
+                Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing
+                if ((Get-Item $zip).Length -gt 1024) { $downloaded = $true; break }
+              } catch {
+                Write-Host "Download failed: $u"
+              }
+            }
+
+            if ($downloaded) {
+              Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp "x") -Force
+              $foundBin = Get-ChildItem (Join-Path $tmp "x") -Directory -Recurse | Where-Object { $_.Name -ieq "bin" } | Select-Object -First 1
+              if ($foundBin) {
+                Copy-Item $foundBin.FullName $binPath -Recurse -Force
+                Write-Host "✅ bin folder copied from upstream zip."
+              } else {
+                Write-Host "⚠️ Upstream zip extracted but bin folder not found."
+              }
+            } else {
+              Write-Host "⚠️ Could not download upstream zip; continuing without bin."
+            }
+          } else {
+            Write-Host "✅ bin folder already present."
+          }
+
+          # 4) Guard: ensure AmazTool.exe exists in final folder
+          if (-not (Test-Path (Join-Path $release "AmazTool.exe"))) {
+            Write-Error "AmazTool.exe not found in final release folder."
             exit 1
           }
-          if (-not (Test-Path (Join-Path $out "bin"))) {
-            Write-Host "⚠️ Output has no bin/ folder. Zip will still be created, but may be smaller."
-          }
 
-      # -----------------------------
-      # Package a single full zip
-      # -----------------------------
-      - name: Package release zip archive (single full zip, include bin)
+      - name: Package release zip (single full zip)
         id: pack
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $src = Join-Path $env:GITHUB_WORKSPACE "v2rayN/Release/windows-64"
-          if (-not (Test-Path $src)) { Write-Error "Release/windows-64 not found"; exit 1 }
-
-          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
-          if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
-          New-Item $dist -ItemType Directory -Force | Out-Null
+          if (Test-Path dist) { Remove-Item dist -Recurse -Force }
+          New-Item dist -ItemType Directory -Force | Out-Null
 
           $zipName = "v2rayN-windows-64-NoAds.zip"
-          $zipPath = Join-Path $dist $zipName
+          $zipPath = Join-Path "dist" $zipName
 
-          Compress-Archive -Path (Join-Path $src "*") -DestinationPath $zipPath -Force
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "out\release\*" -DestinationPath $zipPath -Force
 
-          "zip=$zipPath" | Out-File $env:GITHUB_OUTPUT -Append
-          "zipname=$zipName" | Out-File $env:GITHUB_OUTPUT -Append
+          "zip_name=$zipName" | Out-File $env:GITHUB_OUTPUT -Append
+          "zip_path=$zipPath" | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host "ZIP: $zipPath"
+          Write-Host "✅ ZIP: $zipPath"
 
       - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
@@ -286,12 +330,7 @@ jobs:
           name: v2rayN-windows-64-NoAds.zip
           path: dist/v2rayN-windows-64-NoAds.zip
 
-      # -----------------------------
-      # Create/Update GitHub Release (single full zip)
-      # Fix: delete same-name asset by ID before upload (avoid 422 already_exists)
-      # -----------------------------
       - name: Create/Update GitHub Release (single full zip)
-        if: always()
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -301,8 +340,9 @@ jobs:
           $repo  = "${{ github.repository }}"
           $tag   = "${{ steps.ver.outputs.tag }}"
           $title = "${{ steps.ver.outputs.title }}"
-          $zip   = "${{ steps.pack.outputs.zip }}"
-          $asset = "${{ steps.pack.outputs.zipname }}"
+          $zip   = "${{ steps.pack.outputs.zip_path }}"
+          $asset = "${{ steps.pack.outputs.zip_name }}"
+          $ver   = "${{ steps.ver.outputs.version }}"
 
           Write-Host "Repo:  $repo"
           Write-Host "Tag:   $tag"
@@ -310,59 +350,30 @@ jobs:
           Write-Host "Asset: $asset"
           Write-Host "Zip:   $zip"
 
-          if (-not (Test-Path $zip)) { Write-Error "Zip not found: $zip"; exit 1 }
+          # build notes WITHOUT here-string (to avoid ANY indentation issues)
+          $notesLines = @(
+            "Auto-built from upstream with promotion menu removed.",
+            "",
+            "- Upstream version: $ver",
+            "- Variant: NoAds",
+            "- Build: win-x64, self-contained",
+            ""
+          )
+          $notes = ($notesLines -join "`n")
 
-          # Ensure release exists (create if missing)
-          $rel = $null
-          try {
-            $rel = gh api "repos/$repo/releases/tags/$tag" 2>$null | ConvertFrom-Json
-          } catch { $rel = $null }
+          # check if release exists
+          $exists = $true
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) { $exists = $false }
 
-          if (-not $rel) {
-            Write-Host "Creating release: $tag"
-            gh release create $tag -R $repo -t $title -n "" | Out-Null
+          if (-not $exists) {
+            gh release create $tag --repo $repo --title "$title" --notes "$notes" --prerelease
           } else {
-            Write-Host "Release exists, updating title: $tag"
-            gh release edit $tag -R $repo -t $title | Out-Null
+            gh release edit $tag --repo $repo --title "$title" --notes "$notes" --prerelease
           }
 
-          # Delete existing asset with same name (by asset ID) to avoid HTTP 422 already_exists
-          $maxDeleteRounds = 5
-          for ($i=1; $i -le $maxDeleteRounds; $i++) {
-            $relJson = gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
-            $ids = @()
-            foreach ($a in $relJson.assets) {
-              if ($a.name -eq $asset) { $ids += $a.id }
-            }
-
-            if ($ids.Count -eq 0) {
-              Write-Host "No existing asset named '$asset' found."
-              break
-            }
-
-            foreach ($id in $ids) {
-              Write-Host "Deleting existing asset id=$id name=$asset"
-              gh api -X DELETE "repos/$repo/releases/assets/$id" | Out-Null
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          # Upload (retry)
-          $maxUpload = 5
-          $ok = $false
-          for ($k=1; $k -le $maxUpload; $k++) {
-            try {
-              Write-Host "Uploading asset (try $k/$maxUpload)..."
-              gh release upload $tag $zip -R $repo --clobber
-              $ok = $true
-              break
-            } catch {
-              Write-Host "Upload failed: $($_.Exception.Message)"
-              Start-Sleep -Seconds 3
-            }
-          }
-
-          if (-not $ok) { Write-Error "Upload failed after retries."; exit 1 }
+          # delete old asset if exists, then upload (prevents 422 already exists)
+          gh release delete-asset $tag $asset --repo $repo --yes 2>$null
+          gh release upload $tag $zip --repo $repo --clobber
 
           Write-Host "✅ Release updated: https://github.com/$repo/releases/tag/$tag"
