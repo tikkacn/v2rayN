@@ -68,9 +68,6 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
-      # ----------------------------
-      # Locate MainWindow.axaml & cs
-      # ----------------------------
       - name: Locate MainWindow axaml & code-behind
         id: locate_mainwindow
         shell: pwsh
@@ -88,9 +85,6 @@ jobs:
           "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
           "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
 
-      # ----------------------------
-      # Remove menuPromotion (XAML + cs) with guard
-      # ----------------------------
       - name: Remove Promotion menu item (XAML) + Fix code-behind references
         shell: pwsh
         run: |
@@ -99,11 +93,9 @@ jobs:
           $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
           $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
 
-          # 1) remove from XAML
           $x  = Get-Content $axaml -Raw -Encoding UTF8
           $x2 = [regex]::Replace($x, '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?', '')
           if ($x2 -eq $x) {
-            # fallback: remove any matching fragment
             $x2 = [regex]::Replace($x, '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*', '')
           }
           if ($x2 -eq $x) { throw "menuPromotion not removed from XAML (pattern not matched)." }
@@ -111,9 +103,7 @@ jobs:
 
           $xCheck = Get-Content $axaml -Raw -Encoding UTF8
           if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') { throw "menuPromotion still exists in XAML after edit." }
-          Write-Host "✅ menuPromotion removed from XAML"
 
-          # 2) remove references from code-behind (aggressive but safe)
           $c  = Get-Content $cs -Raw -Encoding UTF8
           $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
           $c2 = [regex]::Replace($c2,'(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}','')
@@ -121,11 +111,7 @@ jobs:
 
           $final = Get-Content $cs -Raw -Encoding UTF8
           if ($final -match '\bmenuPromotion\b') { throw "menuPromotion still referenced in MainWindow.axaml.cs after cleanup." }
-          Write-Host "✅ menuPromotion references removed from code-behind"
 
-      # ----------------------------
-      # Detect version (NO grep / NO locale issues)
-      # ----------------------------
       - name: Detect version (upstream) + decide tag/title
         id: ver
         shell: pwsh
@@ -145,13 +131,6 @@ jobs:
           "tag=$tag"         | Out-File $env:GITHUB_OUTPUT -Append
           "title=$title"     | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host "version=$version"
-          Write-Host "tag=$tag"
-          Write-Host "title=$title"
-
-      # ----------------------------
-      # Publish v2rayN desktop
-      # ----------------------------
       - name: Publish v2rayN Desktop (win-x64, self-contained)
         shell: pwsh
         run: |
@@ -161,9 +140,6 @@ jobs:
             -p:SelfContained=true `
             -o out/v2rayN
 
-      # ----------------------------
-      # Publish AmazTool
-      # ----------------------------
       - name: Publish AmazTool (win-x64, self-contained)
         shell: pwsh
         run: |
@@ -177,64 +153,82 @@ jobs:
             throw "AmazTool.exe not found after publish."
           }
 
-      # ----------------------------
-      # Download upstream official zip to get bin/
-      #   - tag could be 7.18.0 OR v7.18.0 (your screenshot shows 7.18.0)
-      #   - asset name varies; we query assets and pick the one containing 'windows-64' and ends with .zip
-      #   - HARD FAIL if bin not obtained (avoid half-size zip forever)
-      # ----------------------------
-      - name: Download upstream official zip & extract bin
+      # ✅ 关键修复：遍历上游 release 的所有 zip，找到“含 bin/”的那个
+      - name: Download upstream official zip & extract bin (robust search)
         id: upstream_bin
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
+
           $version = "${{ steps.ver.outputs.version }}"
           $tryTags = @($version, "v$version")
 
-          $found = $false
+          if (Test-Path upstream) { Remove-Item upstream -Recurse -Force }
+          New-Item upstream -ItemType Directory | Out-Null
+
+          $pickedTag = $null
+          $pickedAsset = $null
+          $binPath = $null
+
           foreach ($t in $tryTags) {
-            try {
-              $rel = gh release view $t -R 2dust/v2rayN --json tagName,assets | ConvertFrom-Json
-              $assets = $rel.assets
-              # pick windows 64 zip (official)
-              $pick = $assets | Where-Object {
-                ($_.name -match 'windows-64') -and ($_.name -match '\.zip$')
-              } | Select-Object -First 1
-
-              if (-not $pick) { continue }
-
-              $assetName = $pick.name
-              Write-Host "Found upstream tag=$t asset=$assetName"
-
-              if (Test-Path upstream) { Remove-Item upstream -Recurse -Force }
-              New-Item upstream -ItemType Directory | Out-Null
-
-              gh release download $t -R 2dust/v2rayN -p $assetName -D upstream
-              Expand-Archive "upstream/$assetName" "upstream/extract" -Force
-
-              if (-not (Test-Path "upstream/extract/bin")) {
-                throw "Upstream zip extracted but bin/ not found inside."
-              }
-
-              "up_tag=$t" | Out-File $env:GITHUB_OUTPUT -Append
-              "up_asset=$assetName" | Out-File $env:GITHUB_OUTPUT -Append
-
-              $found = $true
-              break
-            } catch {
-              Write-Host "Try tag=$t failed: $($_.Exception.Message)"
+            Write-Host "=== Try upstream tag: $t ==="
+            gh release view $t -R 2dust/v2rayN --json assets,tagName > upstream\rel.json 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "release not found for tag=$t"
+              continue
             }
+
+            $rel = Get-Content upstream\rel.json -Raw | ConvertFrom-Json
+            $assets = $rel.assets
+
+            # 只看 zip，优先排除 desktop（因为你已经证明 desktop 没 bin）
+            $zips = @($assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -ExpandProperty name)
+            if ($zips.Count -eq 0) { Write-Host "No zip assets under tag=$t"; continue }
+
+            # 排序：先尝试非 desktop 的，再尝试 desktop（兜底）
+            $zips = @(
+              $zips | Where-Object { $_ -notmatch 'desktop' }
+            ) + @(
+              $zips | Where-Object { $_ -match 'desktop' }
+            )
+
+            foreach ($a in $zips) {
+              Write-Host "Try asset: $a"
+              try {
+                Remove-Item upstream\*.zip -Force -ErrorAction SilentlyContinue
+                Remove-Item upstream\extract -Recurse -Force -ErrorAction SilentlyContinue
+                New-Item upstream\extract -ItemType Directory | Out-Null
+
+                gh release download $t -R 2dust/v2rayN -p $a -D upstream
+                Expand-Archive "upstream/$a" "upstream/extract" -Force
+
+                if (Test-Path "upstream/extract/bin") {
+                  $pickedTag = $t
+                  $pickedAsset = $a
+                  $binPath = "upstream/extract/bin"
+                  break
+                } else {
+                  Write-Host "No bin/ inside $a"
+                }
+              } catch {
+                Write-Host "Asset failed: $a ; $($_.Exception.Message)"
+              }
+            }
+
+            if ($binPath) { break }
           }
 
-          if (-not $found) {
-            throw "Cannot fetch upstream official windows zip for version=$version (tried: $($tryTags -join ', '))."
+          if (-not $binPath) {
+            throw "Cannot fetch upstream bin/ for version=$version (tried tags: $($tryTags -join ', '))."
           }
 
-      # ----------------------------
-      # Assemble final release folder (MUST include AmazTool.exe + bin/)
-      # ----------------------------
+          "up_tag=$pickedTag" | Out-File $env:GITHUB_OUTPUT -Append
+          "up_asset=$pickedAsset" | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "✅ Found bin/ from tag=$pickedTag asset=$pickedAsset"
+
       - name: Assemble release folder (ensure AmazTool + bin)
         shell: pwsh
         run: |
@@ -245,18 +239,11 @@ jobs:
 
           Copy-Item out/v2rayN/* release -Recurse -Force
           Copy-Item out/amaz/AmazTool.exe release -Force
-
-          # bring bin from upstream official
           Copy-Item upstream/extract/bin release/bin -Recurse -Force
 
           if (-not (Test-Path release/bin)) { throw "bin folder missing after assemble." }
           if (-not (Test-Path release/AmazTool.exe)) { throw "AmazTool.exe missing after assemble." }
 
-          Write-Host "✅ release folder ready"
-
-      # ----------------------------
-      # Package single full zip (only ONE zip)
-      # ----------------------------
       - name: Package release zip (single full zip, include bin)
         id: pack
         shell: pwsh
@@ -270,19 +257,12 @@ jobs:
           "zip=$zip" | Out-File $env:GITHUB_OUTPUT -Append
           "asset_name=v2rayN-windows-64-NoAds.zip" | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host "ZIP=$zip"
-
       - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
         with:
           name: v2rayN-windows-64-NoAds
           path: dist/v2rayN-windows-64-NoAds.zip
 
-      # ----------------------------
-      # Create / Update release (ONLY 1 asset, overwrite safely)
-      #   - no 422: delete-asset ignore + upload --clobber
-      #   - notes built from ARRAY (no here-string)
-      # ----------------------------
       - name: Create/Update GitHub Release (single full zip)
         shell: pwsh
         env:
