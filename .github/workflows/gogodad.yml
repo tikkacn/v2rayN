@@ -195,6 +195,8 @@ jobs:
       - name: Publish AmazTool (win-x64, self-contained)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $proj = Get-ChildItem -Recurse -File -Filter "AmazTool.csproj" | Select-Object -First 1
           if (-not $proj) { throw "AmazTool.csproj not found" }
 
@@ -236,7 +238,7 @@ jobs:
             $line = $json | Where-Object { $_.Split('|')[0] -eq $assetWanted } | Select-Object -First 1
             if (-not $line) { continue }
 
-            $url = $line.Split('|',2)[1]
+            $url = $line.Split('|', 2)[1]
             Write-Host "Found upstream asset: $assetWanted"
             Write-Host "Downloading..."
             $zipPath = "temp\up\$assetWanted"
@@ -265,103 +267,3 @@ jobs:
           if (-not $found) {
             throw "Cannot fetch upstream bin/ from $assetWanted for version=$ver (tried tags: $($tagCandidates -join ', '))."
           }
-
-      - name: Assemble release folder (v2rayN-windows-64 + bin + AmazTool)
-        id: pack
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $root = "release\v2rayN-windows-64"
-          if (Test-Path "release") { Remove-Item "release" -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $root | Out-Null
-
-          # Copy app publish output
-          Copy-Item -Path "out\app\*" -Destination $root -Recurse -Force
-
-          # Copy AmazTool output to root (so AmazTool.exe sits beside v2rayN.exe like upstream)
-          Copy-Item -Path "out\amaz\*" -Destination $root -Recurse -Force
-
-          # Copy upstream bin into root\bin
-          $upBin = "${{ steps.upstream_bin.outputs.bin_dir }}"
-          if (-not (Test-Path $upBin)) { throw "Upstream bin_dir not exists: $upBin" }
-
-          $destBin = Join-Path $root "bin"
-          if (Test-Path $destBin) { Remove-Item $destBin -Recurse -Force }
-          Copy-Item -Path $upBin -Destination $destBin -Recurse -Force
-
-          # Final sanity checks
-          if (-not (Test-Path (Join-Path $root "v2rayN.exe"))) { throw "v2rayN.exe not found in assembled folder" }
-          if (-not (Test-Path (Join-Path $root "AmazTool.exe"))) { throw "AmazTool.exe not found in assembled folder" }
-          if (-not (Test-Path $destBin)) { throw "bin folder not found in assembled folder" }
-
-          Write-Host "✅ Assembled: $root"
-          "release_dir=$root" | Out-File $env:GITHUB_OUTPUT -Append
-
-      - name: Package release zip (single full zip, include bin)
-        id: zip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
-
-          $zipName = "v2rayN-windows-64-NoAds.zip"
-          $zipPath = Join-Path "dist" $zipName
-
-          # Zip the top folder "v2rayN-windows-64" (matches upstream style)
-          Compress-Archive -Path "release\v2rayN-windows-64" -DestinationPath $zipPath -Force
-
-          "zip_path=$zipPath" | Out-File $env:GITHUB_OUTPUT -Append
-          "asset_name=$zipName" | Out-File $env:GITHUB_OUTPUT -Append
-
-          Write-Host "ZIP: $zipPath"
-
-      - name: Upload artifact (single zip)
-        uses: actions/upload-artifact@v4
-        with:
-          name: v2rayN-windows-64-NoAds.zip
-          path: ${{ steps.zip.outputs.zip_path }}
-
-      - name: Create/Update GitHub Release (single full zip, delete old asset to avoid 422)
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $repo = $env:GITHUB_REPOSITORY
-          $tag = "${{ steps.ver.outputs.tag }}"
-          $title = "${{ steps.ver.outputs.title }}"
-          $zip = "${{ steps.zip.outputs.zip_path }}"
-          $asset = "${{ steps.zip.outputs.asset_name }}"
-          $ver = "${{ steps.ver.outputs.version }}"
-
-          # Notes as array -> join (avoid here-string indentation issues)
-          $notesLines = @(
-            "Auto-built from upstream with promotion menu removed.",
-            "",
-            "- Upstream code version: $ver",
-            "- Variant: NoAds / 去广告",
-            "- Build: win-x64, self-contained",
-            "- Included: AmazTool.exe + bin/"
-          )
-          $notes = ($notesLines -join "`n")
-
-          # Ensure release exists
-          gh release view $tag -R $repo *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag -R $repo --title $title --notes $notes --prerelease
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag" }
-          } else {
-            gh release edit $tag -R $repo --title $title --notes $notes --prerelease
-            if ($LASTEXITCODE -ne 0) { throw "Failed to edit release $tag" }
-          }
-
-          # Delete existing asset (ignore errors), then upload with clobber
-          gh release delete-asset $tag $asset -R $repo --yes 2>$null
-          gh release upload $tag $zip -R $repo --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Failed to upload asset to release $tag" }
-
-          Write-Host "✅ Release updated: https://github.com/$repo/releases/tag/$tag"
