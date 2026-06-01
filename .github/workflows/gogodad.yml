@@ -428,10 +428,10 @@ jobs:
           # Ensure release exists; if not, create
           gh release view $tag --repo $repo *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo $repo --title $title --notes $notes --prerelease
+            gh release create $tag --repo $repo --title $title --notes $notes
             if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag" }
           } else {
-            gh release edit $tag --repo $repo --title $title --notes $notes --prerelease
+            gh release edit $tag --repo $repo --title $title --notes $notes --latest
             if ($LASTEXITCODE -ne 0) { throw "Failed to edit release $tag" }
           }
 
