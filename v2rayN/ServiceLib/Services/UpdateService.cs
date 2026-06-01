@@ -291,6 +291,11 @@ public class UpdateService(Config config, Func<bool, string, Task> updateFunc)
                 return url;
             }
 
+            if (url?.Contains("v2rayN-windows-64-NoAds.zip", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return url;
+            }
+
             //Check for avalonia desktop windows version
             if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), "libHarfBuzzSharp.dll")))
             {
