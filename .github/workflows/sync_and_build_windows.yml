@@ -275,7 +275,7 @@ jobs:
             -p:SelfContained=true `
             -o publish
 
-      - name: Add version tag
+      - name: Check release tag
         shell: pwsh
         run: |
           $tagName = "${{ steps.release_tag.outputs.tag }}"
@@ -285,8 +285,7 @@ jobs:
             exit 1
           }
 
-          git tag $tagName
-          git push origin $tagName
+          Write-Host "Release tag is available: $tagName"
 
       - name: Zip artifact
         shell: pwsh
