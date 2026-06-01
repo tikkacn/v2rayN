@@ -303,7 +303,7 @@ jobs:
       - name: Upload to GitHub Release
         uses: svenstaro/upload-release-action@v2
         with:
-          file: dist\v2rayN-windows-64-NoAds.zip
+          file: dist/v2rayN-windows-64-NoAds.zip
           tag: ${{ steps.release_tag.outputs.tag }}
           file_glob: true
           prerelease: true
