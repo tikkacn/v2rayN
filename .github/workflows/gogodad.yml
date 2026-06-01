@@ -104,6 +104,7 @@ jobs:
 
           $globalFile = "v2rayN\ServiceLib\Global.cs"
           $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
+          $updateServiceFile = "v2rayN\ServiceLib\Services\UpdateService.cs"
 
           $g = Get-Content $globalFile -Raw -Encoding UTF8
           $g = $g -replace '\{ ECoreType\.v2rayN,\s*"2dust/v2rayN"\s*\},', '{ ECoreType.v2rayN, "tikkacn/v2rayN" },'
@@ -113,8 +114,35 @@ jobs:
           $c = $c -replace 'v2rayN-windows-64\.zip', 'v2rayN-windows-64-NoAds.zip'
           Set-Content $coreInfoFile $c -Encoding UTF8
 
+          $u = Get-Content $updateServiceFile -Raw -Encoding UTF8
+          $pattern = '[ \t]*//Check for avalonia desktop windows version\s*if \(File\.Exists\(Path\.Combine\(Utils\.GetBaseDirectory\(\), "libHarfBuzzSharp\.dll"\)\)\s*\{\s*return url\?\.Replace\("\.zip", "-desktop\.zip"\);\s*\}\s*return url;'
+          $replacementLines = @(
+              '            if (url?.Contains("v2rayN-windows-64-NoAds.zip", StringComparison.OrdinalIgnoreCase) == true)',
+              '            {',
+              '                return url;',
+              '            }',
+              '',
+              '            //Check for avalonia desktop windows version',
+              '            if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), "libHarfBuzzSharp.dll")))',
+              '            {',
+              '                return url?.Replace(".zip", "-desktop.zip");',
+              '            }',
+              '',
+              '            return url;'
+          )
+          $replacement = $replacementLines -join [Environment]::NewLine
+          $rx = [regex]::new($pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+
+          if (-not $rx.IsMatch($u)) {
+              throw "UpdateService.cs desktop rename block not found"
+          }
+
+          $u = $rx.Replace($u, $replacement, 1)
+          Set-Content $updateServiceFile $u -Encoding UTF8
+
           Write-Host "✅ v2rayN self-update source set to tikkacn/v2rayN"
           Write-Host "✅ v2rayN self-update asset set to v2rayN-windows-64-NoAds.zip"
+          Write-Host "✅ NoAds package will not be renamed to -desktop.zip"
 
       - name: Locate MainWindow axaml & code-behind
         id: locate_mainwindow
