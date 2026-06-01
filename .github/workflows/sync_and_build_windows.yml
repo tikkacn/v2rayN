@@ -2,6 +2,16 @@ name: sync_and_build_windows
 
 on:
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "手动构建使用的上游版本/分支，例如 v7.22.3、v7.22.4、master"
+        required: true
+        default: "master"
+        type: string
+      release_tag:
+        description: "要发布的 NoAds tag，例如 v7.22.3-NoAds、v7.22.4-NoAds"
+        required: true
+        type: string
   schedule:
     - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
 
@@ -33,11 +43,13 @@ jobs:
         shell: pwsh
         run: |
           git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
-          git fetch upstream --prune
+          git fetch upstream --prune --tags
+          git fetch origin --prune --tags
           git remote set-head upstream -a
 
       - name: Detect upstream changes
         id: diff
+        if: github.event_name == 'schedule'
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
@@ -48,13 +60,14 @@ jobs:
           Write-Host "Upstream ahead by $behind commits"
 
       - name: Exit if no upstream updates
-        if: steps.diff.outputs.behind == '0'
+        if: github.event_name == 'schedule' && steps.diff.outputs.behind == '0'
         shell: pwsh
         run: |
           Write-Host "No upstream updates. Exit."
           exit 0
 
       - name: Merge upstream & push
+        if: github.event_name == 'schedule'
         shell: pwsh
         run: |
           $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
@@ -63,10 +76,103 @@ jobs:
           git merge --no-edit $up
           git push origin HEAD
 
+      - name: Checkout manual base ref
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $baseRef = "${{ github.event.inputs.base_ref }}"
+
+          if ([string]::IsNullOrWhiteSpace($baseRef)) {
+            Write-Error "base_ref is empty."
+            exit 1
+          }
+
+          Write-Host "Manual base_ref: $baseRef"
+
+          if (git rev-parse --verify --quiet "refs/tags/$baseRef") {
+            git checkout --force "refs/tags/$baseRef"
+          }
+          elseif (git rev-parse --verify --quiet "refs/remotes/upstream/$baseRef") {
+            git checkout --force "refs/remotes/upstream/$baseRef"
+          }
+          elseif (git rev-parse --verify --quiet "refs/remotes/origin/$baseRef") {
+            git checkout --force "refs/remotes/origin/$baseRef"
+          }
+          elseif (git rev-parse --verify --quiet "$baseRef") {
+            git checkout --force "$baseRef"
+          }
+          else {
+            Write-Error "Cannot find base_ref: $baseRef"
+            exit 1
+          }
+
+          git submodule update --init --recursive
+
+      - name: Determine release tag
+        id: release_tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tagName = "${{ github.event.inputs.release_tag }}"
+          } else {
+            $tagName = "v$(date +'%Y.%m.%d')-NoAds"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tagName)) {
+            Write-Error "release tag is empty."
+            exit 1
+          }
+
+          "tag=$tagName" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Release tag: $tagName"
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
+
+      - name: Apply NoAds self-update source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $globalFile = "v2rayN\ServiceLib\Global.cs"
+          $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
+
+          if (-not (Test-Path $globalFile)) {
+            Write-Error "Global.cs not found: $globalFile"
+            exit 1
+          }
+
+          if (-not (Test-Path $coreInfoFile)) {
+            Write-Error "CoreInfoManager.cs not found: $coreInfoFile"
+            exit 1
+          }
+
+          $g = Get-Content $globalFile -Raw -Encoding UTF8
+          $g = $g -replace '\{ ECoreType\.v2rayN,\s*"2dust/v2rayN"\s*\},', '{ ECoreType.v2rayN, "tikkacn/v2rayN" },'
+          Set-Content $globalFile $g -Encoding UTF8
+
+          $c = Get-Content $coreInfoFile -Raw -Encoding UTF8
+          $c = $c -replace 'v2rayN-windows-64\.zip', 'v2rayN-windows-64-NoAds.zip'
+          Set-Content $coreInfoFile $c -Encoding UTF8
+
+          $gCheck = Get-Content $globalFile -Raw -Encoding UTF8
+          $cCheck = Get-Content $coreInfoFile -Raw -Encoding UTF8
+
+          if ($gCheck -notmatch 'tikkacn/v2rayN') {
+            Write-Error "Failed to set v2rayN update source to tikkacn/v2rayN."
+            exit 1
+          }
+
+          if ($cCheck -notmatch 'v2rayN-windows-64-NoAds\.zip') {
+            Write-Error "Failed to set v2rayN NoAds download asset name."
+            exit 1
+          }
+
+          Write-Host "✅ v2rayN self-update source set to tikkacn/v2rayN"
+          Write-Host "✅ v2rayN self-update asset set to v2rayN-windows-64-NoAds.zip"
 
       - name: Locate MainWindow axaml & code-behind
         id: locate_mainwindow
@@ -169,10 +275,16 @@ jobs:
             -p:SelfContained=true `
             -o publish
 
-      - name: Add version tag (include "NoAds" in version)
+      - name: Add version tag
         shell: pwsh
         run: |
-          $tagName = "v$(date +'%Y.%m.%d')-NoAds"
+          $tagName = "${{ steps.release_tag.outputs.tag }}"
+
+          if (git ls-remote --tags origin "refs/tags/$tagName" | Select-String $tagName) {
+            Write-Error "Remote tag already exists: $tagName"
+            exit 1
+          }
+
           git tag $tagName
           git push origin $tagName
 
@@ -181,20 +293,19 @@ jobs:
         run: |
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           New-Item dist -ItemType Directory -Force | Out-Null
-          Compress-Archive -Path publish\* -DestinationPath dist\v2rayN-windows-64-noads.zip -Force
+          Compress-Archive -Path publish\* -DestinationPath dist\v2rayN-windows-64-NoAds.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: v2rayN-windows-64-noads.zip
-          path: dist/v2rayN-windows-64-noads.zip
+          name: v2rayN-windows-64-NoAds.zip
+          path: dist/v2rayN-windows-64-NoAds.zip
 
-      - name: Upload to GitHub Release (optional)
-        if: github.event.inputs.release_tag != ''
+      - name: Upload to GitHub Release
         uses: svenstaro/upload-release-action@v2
         with:
-          file: dist\v2rayN-windows-64-noads.zip
-          tag: ${{ github.event.inputs.release_tag }}
+          file: dist\v2rayN-windows-64-NoAds.zip
+          tag: ${{ steps.release_tag.outputs.tag }}
           file_glob: true
           prerelease: true
 
