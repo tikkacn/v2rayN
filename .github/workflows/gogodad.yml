@@ -104,6 +104,7 @@ jobs:
 
           $globalFile = "v2rayN\ServiceLib\Global.cs"
           $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
+          $updateServiceFile = "v2rayN\ServiceLib\Services\UpdateService.cs"
 
           $g = Get-Content $globalFile -Raw -Encoding UTF8
           $g = $g -replace '\{ ECoreType\.v2rayN,\s*"2dust/v2rayN"\s*\},', '{ ECoreType.v2rayN, "tikkacn/v2rayN" },'
@@ -113,8 +114,21 @@ jobs:
           $c = $c -replace 'v2rayN-windows-64\.zip', 'v2rayN-windows-64-NoAds.zip'
           Set-Content $coreInfoFile $c -Encoding UTF8
 
+          $u = Get-Content $updateServiceFile -Raw -Encoding UTF8
+          $u = $u -replace 'if \(File\.Exists\(Path\.Combine\(Utils\.GetBaseDirectory\(\), "libHarfBuzzSharp\.dll"\)\)\s*\{\s*return url\?\.Replace\("\.zip", "-desktop\.zip"\);\s*\}', 'if (url?.Contains("v2rayN-windows-64-NoAds.zip", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return url;
+            }
+
+            if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), "libHarfBuzzSharp.dll")))
+            {
+                return url?.Replace(".zip", "-desktop.zip");
+            }'
+          Set-Content $updateServiceFile $u -Encoding UTF8
+
           Write-Host "✅ v2rayN self-update source set to tikkacn/v2rayN"
           Write-Host "✅ v2rayN self-update asset set to v2rayN-windows-64-NoAds.zip"
+          Write-Host "✅ NoAds package will not be renamed to -desktop.zip"
 
       - name: Locate MainWindow axaml & code-behind
         id: locate_mainwindow
