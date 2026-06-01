@@ -112,6 +112,7 @@ jobs:
 
           $c = Get-Content $coreInfoFile -Raw -Encoding UTF8
           $c = $c -replace 'v2rayN-windows-64\.zip', 'v2rayN-windows-64-NoAds.zip'
+          $c = $c -replace '/download/\{0\}/v2rayN-windows-64-NoAds\.zip', '/download/v{0}/v2rayN-windows-64-NoAds.zip'
           Set-Content $coreInfoFile $c -Encoding UTF8
 
           $u = Get-Content $updateServiceFile -Raw -Encoding UTF8
