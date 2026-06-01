@@ -64,7 +64,7 @@ public sealed class CoreInfoManager
                     CoreType = ECoreType.v2rayN,
                     Url = GetCoreUrl(ECoreType.v2rayN),
                     ReleaseApiUrl = urlN.Replace(Global.GithubUrl, Global.GithubApiUrl),
-                    DownloadUrlWin64 = urlN + "/download/{0}/v2rayN-windows-64.zip",
+                    DownloadUrlWin64 = urlN + "/download/{0}/v2rayN-windows-64-NoAds.zip",
                     DownloadUrlWinArm64 = urlN + "/download/{0}/v2rayN-windows-arm64.zip",
                     DownloadUrlLinux64 = urlN + "/download/{0}/v2rayN-linux-64.zip",
                     DownloadUrlLinuxArm64 = urlN + "/download/{0}/v2rayN-linux-arm64.zip",
