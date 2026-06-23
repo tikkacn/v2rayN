@@ -113,36 +113,54 @@ jobs:
           $c = Get-Content $coreInfoFile -Raw -Encoding UTF8
           $c = $c -replace 'v2rayN-windows-64\.zip', 'v2rayN-windows-64-NoAds.zip'
           $c = $c -replace '/download/\{0\}/v2rayN-windows-64-NoAds\.zip', '/download/v{0}-NoAds/v2rayN-windows-64-NoAds.zip'
+          $c = $c -replace '/download/v\{0\}/v2rayN-windows-64-NoAds\.zip', '/download/v{0}-NoAds/v2rayN-windows-64-NoAds.zip'
           Set-Content $coreInfoFile $c -Encoding UTF8
 
           $u = Get-Content $updateServiceFile -Raw -Encoding UTF8
 
-          $pattern = '(?s)(?<indent>[ \t]*)if\s*\(\s*File\.Exists\(Path\.Combine\(Utils\.GetBaseDirectory\(\),\s*"libHarfBuzzSharp\.dll"\)\)\s*\)\s*\{\s*return\s+url\?\.Replace\("\.zip",\s*"-desktop\.zip"\);\s*\}'
+          $oldVersionReturn = 'return new UpdateResult(true, new SemanticVersion(tagName));'
+          $newVersionReturn = @(
+              '        if (type == ECoreType.v2rayN && tagName?.EndsWith("-NoAds", StringComparison.OrdinalIgnoreCase) == true)',
+              '        {',
+              '            tagName = tagName[..^"-NoAds".Length];',
+              '        }',
+              '',
+              '        return new UpdateResult(true, new SemanticVersion(tagName));'
+          ) -join [Environment]::NewLine
 
-          $match = [regex]::Match($u, $pattern)
-          if (-not $match.Success) {
+          if (-not $u.Contains($oldVersionReturn)) {
+              throw "UpdateService.cs version return block not found"
+          }
+
+          $u = $u.Replace($oldVersionReturn, $newVersionReturn)
+
+          $patternDesktop = '(?s)(?<indent>[ \t]*)if\s*\(\s*File\.Exists\(Path\.Combine\(Utils\.GetBaseDirectory\(\),\s*"libHarfBuzzSharp\.dll"\)\)\s*\)\s*\{\s*return\s+url\?\.Replace\("\.zip",\s*"-desktop\.zip"\);\s*\}'
+
+          $matchDesktop = [regex]::Match($u, $patternDesktop)
+          if (-not $matchDesktop.Success) {
               throw "UpdateService.cs desktop rename block not found"
           }
 
-          $indent = $match.Groups["indent"].Value
+          $indent = $matchDesktop.Groups["indent"].Value
 
-          $replacement = @"
-          ${indent}if (url?.Contains("v2rayN-windows-64-NoAds.zip", StringComparison.OrdinalIgnoreCase) == true)
-          ${indent}{
-          ${indent}    return url;
-          ${indent}}
+          $replacementDesktop = @(
+              "${indent}if (url?.Contains(""v2rayN-windows-64-NoAds.zip"", StringComparison.OrdinalIgnoreCase) == true)",
+              "${indent}{",
+              "${indent}    return url;",
+              "${indent}}",
+              "",
+              "${indent}if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), ""libHarfBuzzSharp.dll"")))",
+              "${indent}{",
+              "${indent}    return url?.Replace("".zip"", ""-desktop.zip"");",
+              "${indent}}"
+          ) -join [Environment]::NewLine
 
-          ${indent}if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), "libHarfBuzzSharp.dll")))
-          ${indent}{
-          ${indent}    return url?.Replace(".zip", "-desktop.zip");
-          ${indent}}
-          "@
-
-          $u = [regex]::Replace($u, $pattern, $replacement, 1)
+          $u = [regex]::Replace($u, $patternDesktop, $replacementDesktop, 1)
           Set-Content $updateServiceFile $u -Encoding UTF8
 
           Write-Host "✅ v2rayN self-update source set to tikkacn/v2rayN"
           Write-Host "✅ v2rayN self-update asset set to v2rayN-windows-64-NoAds.zip"
+          Write-Host "✅ NoAds release tag will be normalized for version comparison"
           Write-Host "✅ NoAds package will not be renamed to -desktop.zip"
 
       - name: Locate MainWindow axaml & code-behind
