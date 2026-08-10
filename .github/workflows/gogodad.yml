@@ -812,7 +812,7 @@ jobs:
           $bytes = "${{ steps.package.outputs.bytes }}"
 
           $notes = @(
-            "基于上游正式 Release 自动构建，原推广入口已改为“通知 / 教程”。",
+            "基于上游正式 Release 自动构建，原推广入口已改为通知 / 教程。",
             "",
             "- 上游版本：$sourceTag",
             "- 上游提交：$sourceSha",
