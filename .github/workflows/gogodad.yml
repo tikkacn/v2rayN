@@ -192,7 +192,7 @@ jobs:
               throw "$Label expected exactly one match in $Path, found $count"
             }
             $text = $text.Replace($Old, $New)
-            Set-Content $Path $text -Encoding UTF8
+            Set-Content $Path $text -Encoding UTF8 -NoNewline
           }
 
           $globalFile = "v2rayN\ServiceLib\Global.cs"
@@ -248,7 +248,7 @@ jobs:
             "${indent}}"
           ) -join [Environment]::NewLine
           $updateText = [regex]::Replace($updateText, $desktopPattern, $desktopReplacement, 1)
-          Set-Content $updateServiceFile $updateText -Encoding UTF8
+          Set-Content $updateServiceFile $updateText -Encoding UTF8 -NoNewline
 
           $xaml = Get-Content $mainXamlFile -Raw -Encoding UTF8
           $menuPattern = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
@@ -256,7 +256,7 @@ jobs:
             throw "Promotion menu item expected exactly one match"
           }
           $xaml = [regex]::Replace($xaml, $menuPattern, '', 1)
-          Set-Content $mainXamlFile $xaml -Encoding UTF8
+          Set-Content $mainXamlFile $xaml -Encoding UTF8 -NoNewline
 
           $code = Get-Content $mainCodeFile -Raw -Encoding UTF8
           $clickPattern = '(?m)^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click;\s*\r?\n?'
@@ -270,7 +270,7 @@ jobs:
             throw "Promotion click handler method expected exactly one match"
           }
           $code = [regex]::Replace($code, $methodPattern, '', 1)
-          Set-Content $mainCodeFile $code -Encoding UTF8
+          Set-Content $mainCodeFile $code -Encoding UTF8 -NoNewline
 
           $xamlCheck = Get-Content $mainXamlFile -Raw -Encoding UTF8
           $codeCheck = Get-Content $mainCodeFile -Raw -Encoding UTF8
