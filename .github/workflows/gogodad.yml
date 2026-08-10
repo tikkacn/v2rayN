@@ -195,6 +195,16 @@ jobs:
             Set-Content $Path $text -Encoding UTF8 -NoNewline
           }
 
+          function Get-NormalizedTextSha256 {
+            param([string]$Path)
+            $text = Get-Content $Path -Raw -Encoding UTF8
+            $text = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+            return [System.Convert]::ToHexString(
+              [System.Security.Cryptography.SHA256]::HashData($bytes)
+            ).ToLowerInvariant()
+          }
+
           $globalFile = "v2rayN\ServiceLib\Global.cs"
           $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
           $updateServiceFile = "v2rayN\ServiceLib\Services\UpdateService.cs"
@@ -222,7 +232,7 @@ jobs:
             if (-not (Test-Path $patch.Source -PathType Leaf)) {
               throw "Smart updater source is missing: $($patch.Source)"
             }
-            $upstreamHash = (Get-FileHash $patch.Target -Algorithm SHA256).Hash.ToLowerInvariant()
+            $upstreamHash = Get-NormalizedTextSha256 $patch.Target
             if ($upstreamHash -cne $patch.UpstreamSha256) {
               throw "Upstream AmazTool changed; review the smart updater before rebuilding: $($patch.Target)"
             }
