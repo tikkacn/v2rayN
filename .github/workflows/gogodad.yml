@@ -198,14 +198,23 @@ jobs:
           $globalFile = "v2rayN\ServiceLib\Global.cs"
           $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
           $updateServiceFile = "v2rayN\ServiceLib\Services\UpdateService.cs"
+          $resourceDesignerFile = "v2rayN\ServiceLib\Resx\ResUI.Designer.cs"
           $mainXamlFile = "v2rayN\v2rayN.Desktop\Views\MainWindow.axaml"
           $mainCodeFile = "v2rayN\v2rayN.Desktop\Views\MainWindow.axaml.cs"
+          $wpfXamlFile = "v2rayN\v2rayN\Views\MainWindow.xaml"
+          $wpfCodeFile = "v2rayN\v2rayN\Views\MainWindow.xaml.cs"
 
           Replace-ExactlyOnce `
             -Path $globalFile `
             -Old '{ ECoreType.v2rayN, "2dust/v2rayN" },' `
             -New '{ ECoreType.v2rayN, "tikkacn/v2rayN" },' `
             -Label "Self-update repository"
+
+          Replace-ExactlyOnce `
+            -Path $globalFile `
+            -Old '    public const string PromotionUrl = @"aHR0cHM6Ly85LjIzNDQ1Ni54eXovYWJjLmh0bWw=";' `
+            -New '' `
+            -Label "Promotion URL constant"
 
           Replace-ExactlyOnce `
             -Path $coreInfoFile `
@@ -272,10 +281,67 @@ jobs:
           $code = [regex]::Replace($code, $methodPattern, '', 1)
           Set-Content $mainCodeFile $code -Encoding UTF8 -NoNewline
 
+          $wpfXaml = Get-Content $wpfXamlFile -Raw -Encoding UTF8
+          $wpfMenuPattern = '(?ms)^\s*<Menu Margin="0,1" Style="\{StaticResource ToolbarMenu\}">\s*<MenuItem\s+x:Name="menuPromotion".*?</MenuItem>\s*</Menu>\s*<Separator\s*/>\s*'
+          if ([regex]::Matches($wpfXaml, $wpfMenuPattern).Count -ne 1) {
+            throw "Windows promotion menu block expected exactly one match"
+          }
+          $wpfXaml = [regex]::Replace($wpfXaml, $wpfMenuPattern, '', 1)
+          Set-Content $wpfXamlFile $wpfXaml -Encoding UTF8 -NoNewline
+
+          $wpfCode = Get-Content $wpfCodeFile -Raw -Encoding UTF8
+          $wpfClickPattern = '(?m)^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click;\s*\r?\n?'
+          if ([regex]::Matches($wpfCode, $wpfClickPattern).Count -ne 1) {
+            throw "Windows promotion click handler registration expected exactly one match"
+          }
+          $wpfCode = [regex]::Replace($wpfCode, $wpfClickPattern, '', 1)
+
+          $wpfMethodPattern = '(?ms)^\s*private void MenuPromotion_Click\([^)]*\)\s*\{.*?^\s*\}\s*'
+          if ([regex]::Matches($wpfCode, $wpfMethodPattern).Count -ne 1) {
+            throw "Windows promotion click handler method expected exactly one match"
+          }
+          $wpfCode = [regex]::Replace($wpfCode, $wpfMethodPattern, '', 1)
+          Set-Content $wpfCodeFile $wpfCode -Encoding UTF8 -NoNewline
+
+          $designer = Get-Content $resourceDesignerFile -Raw -Encoding UTF8
+          $designerCommentPattern = '(?ms)^\s*/// <summary>\s*///\s*查找类似 Promotion 的本地化字符串。\s*/// </summary>\s*(?=public static string menuPromotion)'
+          if ([regex]::Matches($designer, $designerCommentPattern).Count -ne 1) {
+            throw "Promotion resource designer comment expected exactly one match"
+          }
+          $designer = [regex]::Replace($designer, $designerCommentPattern, '', 1)
+          $designerPropertyPattern = '(?ms)^\s*public static string menuPromotion\s*\{\s*get\s*\{\s*return ResourceManager\.GetString\("menuPromotion", resourceCulture\);\s*\}\s*\}\s*'
+          if ([regex]::Matches($designer, $designerPropertyPattern).Count -ne 1) {
+            throw "Promotion resource designer property expected exactly one match"
+          }
+          $designer = [regex]::Replace($designer, $designerPropertyPattern, '', 1)
+          Set-Content $resourceDesignerFile $designer -Encoding UTF8 -NoNewline
+
+          $resourcePattern = '(?ms)^\s*<data name="menuPromotion" xml:space="preserve">\s*<value>.*?</value>\s*</data>\s*'
+          $resourceFiles = @(Get-ChildItem "v2rayN\ServiceLib\Resx" -File -Filter "ResUI*.resx" |
+            Where-Object { (Get-Content $_.FullName -Raw -Encoding UTF8) -match 'name="menuPromotion"' })
+          if ($resourceFiles.Count -eq 0) {
+            throw "No localized promotion resources were found"
+          }
+          foreach ($resourceFile in $resourceFiles) {
+            $resourceText = Get-Content $resourceFile.FullName -Raw -Encoding UTF8
+            if ([regex]::Matches($resourceText, $resourcePattern).Count -ne 1) {
+              throw "Localized promotion resource expected exactly one match in $($resourceFile.FullName)"
+            }
+            $resourceText = [regex]::Replace($resourceText, $resourcePattern, '', 1)
+            Set-Content $resourceFile.FullName $resourceText -Encoding UTF8 -NoNewline
+          }
+
           $xamlCheck = Get-Content $mainXamlFile -Raw -Encoding UTF8
           $codeCheck = Get-Content $mainCodeFile -Raw -Encoding UTF8
           if ($xamlCheck -match '\bmenuPromotion\b' -or $codeCheck -match '\bmenuPromotion\b') {
             throw "Promotion menu references still exist after patch"
+          }
+
+          $promotionMarkers = @(Get-ChildItem "v2rayN" -Recurse -File -Include "*.cs", "*.xaml", "*.axaml", "*.resx" |
+            Select-String -Pattern '\bmenuPromotion\b|\bPromotionUrl\b|aHR0cHM6Ly85LjIzNDQ1Ni54eXovYWJjLmh0bWw=')
+          if ($promotionMarkers.Count -gt 0) {
+            $details = $promotionMarkers | ForEach-Object { "$($_.Path):$($_.LineNumber):$($_.Line.Trim())" }
+            throw "Promotion source markers remain after patch: $($details -join '; ')"
           }
 
           git diff --check
