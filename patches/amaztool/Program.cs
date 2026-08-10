@@ -5,6 +5,9 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        var pauseOnError = args.Length == 0 ||
+            !string.Equals(args[0], "validateupdate", StringComparison.OrdinalIgnoreCase);
+
         try
         {
             if (args.Length == 0)
@@ -53,7 +56,7 @@ internal static class Program
             Console.Error.WriteLine($"Upgrade failed with exit code {Environment.ExitCode}.");
             Console.Error.WriteLine(ex);
             Console.WriteLine("Press any key to close this window...");
-            if (!Console.IsInputRedirected)
+            if (pauseOnError && !Console.IsInputRedirected)
             {
                 Console.ReadKey(true);
             }

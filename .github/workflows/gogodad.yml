@@ -523,6 +523,39 @@ jobs:
             }
           }
 
+          $unsafeZip = Join-Path $testRoot "unsafe-layout.zip"
+          $stream = [System.IO.File]::Open($unsafeZip, [System.IO.FileMode]::Create)
+          try {
+            $archive = [System.IO.Compression.ZipArchive]::new(
+              $stream,
+              [System.IO.Compression.ZipArchiveMode]::Create,
+              $false
+            )
+            try {
+              foreach ($entryName in @("v2rayN.exe", "AmazTool.exe", "../outside.txt")) {
+                $entry = $archive.CreateEntry($entryName)
+                $writer = [System.IO.StreamWriter]::new($entry.Open())
+                try { $writer.Write("dummy") } finally { $writer.Dispose() }
+              }
+            }
+            finally {
+              $archive.Dispose()
+            }
+          }
+          finally {
+            $stream.Dispose()
+          }
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          $unsafeOutput = @(& $amazTool validateupdate (Resolve-Path $unsafeZip).Path 2>&1)
+          $unsafeExitCode = $LASTEXITCODE
+          $PSNativeCommandUseErrorActionPreference = $true
+          $unsafeText = $unsafeOutput -join [Environment]::NewLine
+          Write-Host $unsafeText
+          if ($unsafeExitCode -ne 1 -or -not $unsafeText.Contains("Unsafe update path")) {
+            throw "Smart updater did not reject a ZIP path traversal entry with exit code 1"
+          }
+
       - name: Download exact upstream Windows package
         if: steps.resolve.outputs.should_build == 'true'
         id: upstream_bin
