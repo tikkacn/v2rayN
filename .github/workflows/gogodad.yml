@@ -195,6 +195,16 @@ jobs:
             Set-Content $Path $text -Encoding UTF8 -NoNewline
           }
 
+          function Get-NormalizedTextSha256 {
+            param([string]$Path)
+            $text = Get-Content $Path -Raw -Encoding UTF8
+            $text = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+            return [System.Convert]::ToHexString(
+              [System.Security.Cryptography.SHA256]::HashData($bytes)
+            ).ToLowerInvariant()
+          }
+
           $globalFile = "v2rayN\ServiceLib\Global.cs"
           $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
           $updateServiceFile = "v2rayN\ServiceLib\Services\UpdateService.cs"
@@ -203,6 +213,31 @@ jobs:
           $mainCodeFile = "v2rayN\v2rayN.Desktop\Views\MainWindow.axaml.cs"
           $wpfXamlFile = "v2rayN\v2rayN\Views\MainWindow.xaml"
           $wpfCodeFile = "v2rayN\v2rayN\Views\MainWindow.xaml.cs"
+          $amazUpgradeFile = "v2rayN\AmazTool\UpgradeApp.cs"
+          $amazProgramFile = "v2rayN\AmazTool\Program.cs"
+
+          $updaterPatches = @(
+            @{
+              Source = "..\automation\patches\amaztool\UpgradeApp.cs"
+              Target = $amazUpgradeFile
+              UpstreamSha256 = "185f7939ba52fbb95084f91d72c2a6414853a7944103cdfd7801bf4e704166ba"
+            },
+            @{
+              Source = "..\automation\patches\amaztool\Program.cs"
+              Target = $amazProgramFile
+              UpstreamSha256 = "b437d8c2486ef81f78c447ef4fbfcc171e3fb6f4730b1aedeb5cdb461b0bbb92"
+            }
+          )
+          foreach ($patch in $updaterPatches) {
+            if (-not (Test-Path $patch.Source -PathType Leaf)) {
+              throw "Smart updater source is missing: $($patch.Source)"
+            }
+            $upstreamHash = Get-NormalizedTextSha256 $patch.Target
+            if ($upstreamHash -cne $patch.UpstreamSha256) {
+              throw "Upstream AmazTool changed; review the smart updater before rebuilding: $($patch.Target)"
+            }
+            Copy-Item -Path $patch.Source -Destination $patch.Target -Force
+          }
 
           Replace-ExactlyOnce `
             -Path $globalFile `
@@ -371,10 +406,28 @@ jobs:
             throw "Guide portal integration is incomplete; found only $($guideMarkers.Count) markers"
           }
 
+          $smartUpdaterText = Get-Content $amazUpgradeFile -Raw -Encoding UTF8
+          $smartUpdaterMarkers = @(
+            'DetectArchiveRoot',
+            'ValidateArchive',
+            'GetSafeOutputPath',
+            'The update archive must contain exactly one v2rayN.exe',
+            'Failed to replace update file after retries'
+          )
+          foreach ($marker in $smartUpdaterMarkers) {
+            if (-not $smartUpdaterText.Contains($marker)) {
+              throw "Smart updater marker is missing: $marker"
+            }
+          }
+          $amazProgramText = Get-Content $amazProgramFile -Raw -Encoding UTF8
+          if (-not $amazProgramText.Contains('Environment.ExitCode = 1')) {
+            throw "AmazTool must expose a non-zero exit code on failure"
+          }
+
           git diff --check
           Write-Host "NoAds changes applied cleanly"
           git diff --stat
-          git diff -- $globalFile $coreInfoFile $updateServiceFile $resourceDesignerFile $mainXamlFile $mainCodeFile $wpfXamlFile $wpfCodeFile "v2rayN\ServiceLib\Resx"
+          git diff -- $globalFile $coreInfoFile $updateServiceFile $resourceDesignerFile $mainXamlFile $mainCodeFile $wpfXamlFile $wpfCodeFile $amazUpgradeFile $amazProgramFile "v2rayN\ServiceLib\Resx"
 
       - name: Restore
         if: steps.resolve.outputs.should_build == 'true'
@@ -418,6 +471,91 @@ jobs:
             -p:PublishTrimmed=true `
             -p:EnableWindowsTargeting=true `
             -o out\amaz
+
+      - name: Validate smart updater archive layouts
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $testRoot = "temp\updater-layout-tests"
+          if (Test-Path $testRoot) { Remove-Item $testRoot -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+
+          $rootLayout = Join-Path $testRoot "root-layout"
+          New-Item -ItemType Directory -Force -Path (Join-Path $rootLayout "bin\xray") | Out-Null
+          Set-Content (Join-Path $rootLayout "v2rayN.exe") "dummy-main" -NoNewline
+          Set-Content (Join-Path $rootLayout "AmazTool.exe") "dummy-updater" -NoNewline
+          Set-Content (Join-Path $rootLayout "bin\xray\xray.exe") "dummy-core" -NoNewline
+          $rootZip = Join-Path $testRoot "root-layout.zip"
+          Compress-Archive -Path "$rootLayout\*" -DestinationPath $rootZip -Force
+
+          $wrapperName = "customer-renamed-folder"
+          $wrapperLayout = Join-Path $testRoot $wrapperName
+          New-Item -ItemType Directory -Force -Path (Join-Path $wrapperLayout "bin\xray") | Out-Null
+          Set-Content (Join-Path $wrapperLayout "v2rayN.exe") "dummy-main" -NoNewline
+          Set-Content (Join-Path $wrapperLayout "AmazTool.exe") "dummy-updater" -NoNewline
+          Set-Content (Join-Path $wrapperLayout "bin\xray\xray.exe") "dummy-core" -NoNewline
+          $wrapperZip = Join-Path $testRoot "wrapper-layout.zip"
+          Compress-Archive -Path $wrapperLayout -DestinationPath $wrapperZip -Force
+
+          $amazTool = (Resolve-Path "out\amaz\AmazTool.exe").Path
+          $cases = @(
+            @{ Zip = (Resolve-Path $rootZip).Path; Layout = "Archive layout: files at ZIP root" },
+            @{ Zip = (Resolve-Path $wrapperZip).Path; Layout = "Archive layout: wrapper directory '$wrapperName'" }
+          )
+          foreach ($case in $cases) {
+            $output = @(& $amazTool validateupdate $case.Zip 2>&1)
+            $text = $output -join [Environment]::NewLine
+            Write-Host $text
+            $markers = @(
+              $case.Layout,
+              "-> v2rayN.exe",
+              "-> AmazTool.exe",
+              "-> bin/xray/xray.exe"
+            )
+            foreach ($marker in $markers) {
+              if (-not $text.Contains($marker)) {
+                throw "Smart updater validation output is missing: $marker"
+              }
+            }
+          }
+
+          $unsafeZip = Join-Path $testRoot "unsafe-layout.zip"
+          $stream = [System.IO.File]::Open($unsafeZip, [System.IO.FileMode]::Create)
+          try {
+            $archive = [System.IO.Compression.ZipArchive]::new(
+              $stream,
+              [System.IO.Compression.ZipArchiveMode]::Create,
+              $false
+            )
+            try {
+              foreach ($entryName in @("v2rayN.exe", "AmazTool.exe", "../outside.txt")) {
+                $entry = $archive.CreateEntry($entryName)
+                $writer = [System.IO.StreamWriter]::new($entry.Open())
+                try { $writer.Write("dummy") } finally { $writer.Dispose() }
+              }
+            }
+            finally {
+              $archive.Dispose()
+            }
+          }
+          finally {
+            $stream.Dispose()
+          }
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          $unsafeOutput = @(& $amazTool validateupdate (Resolve-Path $unsafeZip).Path 2>&1)
+          $unsafeExitCode = $LASTEXITCODE
+          $PSNativeCommandUseErrorActionPreference = $true
+          $unsafeText = $unsafeOutput -join [Environment]::NewLine
+          Write-Host $unsafeText
+          if ($unsafeExitCode -ne 1 -or -not $unsafeText.Contains("Unsafe update path")) {
+            throw "Smart updater did not reject a ZIP path traversal entry with exit code 1"
+          }
+          $global:LASTEXITCODE = 0
 
       - name: Download exact upstream Windows package
         if: steps.resolve.outputs.should_build == 'true'
@@ -468,35 +606,48 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path dist\release | Out-Null
-          Copy-Item -Path out\app\* -Destination dist\release -Recurse -Force
+          $packageRootName = [System.IO.Path]::GetFileNameWithoutExtension($env:RELEASE_ASSET)
+          $packageRoot = Join-Path "dist" $packageRootName
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          Copy-Item -Path out\app\* -Destination $packageRoot -Recurse -Force
 
           $amazExe = Get-ChildItem -Path out\amaz -File -Filter "AmazTool.exe" -Recurse |
             Select-Object -First 1
           if (-not $amazExe) { throw "AmazTool.exe was not produced" }
-          Copy-Item -Path $amazExe.FullName -Destination dist\release\AmazTool.exe -Force
+          Copy-Item -Path $amazExe.FullName -Destination (Join-Path $packageRoot "AmazTool.exe") -Force
 
           $binDir = "${{ steps.upstream_bin.outputs.bin_dir }}"
           if (-not $binDir -or -not (Test-Path $binDir)) {
             throw "Verified upstream bin directory output is missing"
           }
-          Copy-Item -Path $binDir -Destination dist\release\bin -Recurse -Force
+          Copy-Item -Path $binDir -Destination (Join-Path $packageRoot "bin") -Recurse -Force
 
           $zipPath = Join-Path (Resolve-Path dist) $env:RELEASE_ASSET
-          Compress-Archive -Path dist\release\* -DestinationPath $zipPath -CompressionLevel Fastest -Force
+          # AmazTool removes the first path component from every ZIP entry during
+          # an in-app update. Keep exactly one wrapper directory, matching the
+          # official upstream packages, so v2rayN.exe and bin/ land correctly.
+          Compress-Archive -Path $packageRoot -DestinationPath $zipPath -CompressionLevel Fastest -Force
 
           $verifyDir = "dist\verify"
           New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
           Expand-Archive -Path $zipPath -DestinationPath $verifyDir -Force
 
+          $topLevelEntries = @(Get-ChildItem -Path $verifyDir -Force)
+          if ($topLevelEntries.Count -ne 1 -or
+              -not $topLevelEntries[0].PSIsContainer -or
+              $topLevelEntries[0].Name -cne $packageRootName) {
+            throw "Final ZIP must contain exactly one updater wrapper directory: $packageRootName"
+          }
+          $verifyRoot = Join-Path $verifyDir $packageRootName
+
           $requiredFiles = @(
-            (Join-Path $verifyDir "v2rayN.exe"),
-            (Join-Path $verifyDir "AmazTool.exe")
+            (Join-Path $verifyRoot "v2rayN.exe"),
+            (Join-Path $verifyRoot "AmazTool.exe")
           )
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path $file -PathType Leaf)) { throw "Required file missing from final ZIP: $file" }
           }
-          $verifiedBin = Join-Path $verifyDir "bin"
+          $verifiedBin = Join-Path $verifyRoot "bin"
           if (-not (Test-Path $verifiedBin -PathType Container)) { throw "bin/ missing from final ZIP" }
           if (@(Get-ChildItem $verifiedBin -File -Recurse).Count -eq 0) { throw "bin/ is empty in final ZIP" }
 
@@ -511,6 +662,124 @@ jobs:
           Write-Host "Final ZIP: $zipPath"
           Write-Host "Bytes: $size"
           Write-Host "SHA-256: $sha256"
+
+      - name: Validate real legacy in-place update
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $repo = $env:GITHUB_REPOSITORY
+          $targetTag = "${{ steps.resolve.outputs.release_tag }}"
+          $candidateZip = "${{ steps.package.outputs.zip }}"
+          $testRoot = "temp\legacy-update-integration"
+          if (Test-Path $testRoot) { Remove-Item $testRoot -Recurse -Force }
+          $baselineDownload = Join-Path $testRoot "baseline-download"
+          $baselineExpanded = Join-Path $testRoot "baseline-expanded"
+          $candidateExpanded = Join-Path $testRoot "candidate-expanded"
+          $installRoot = Join-Path $testRoot "customer-moved-installation"
+          New-Item -ItemType Directory -Force -Path $baselineDownload, $baselineExpanded, $candidateExpanded, $installRoot | Out-Null
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $targetTag --repo $repo *> $null
+          $targetReleaseExists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($targetReleaseExists) {
+            $baselineTag = $targetTag
+          }
+          else {
+            $baselineTag = gh release view --repo $repo --json tagName --jq .tagName
+            if ($LASTEXITCODE -ne 0 -or -not $baselineTag) {
+              throw "No previous NoAds release is available for legacy updater testing"
+            }
+          }
+
+          gh release download $baselineTag `
+            --repo $repo `
+            --pattern $env:RELEASE_ASSET `
+            --dir $baselineDownload `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download legacy package from $baselineTag" }
+
+          $baselineZip = Get-ChildItem $baselineDownload -File -Filter $env:RELEASE_ASSET |
+            Select-Object -First 1
+          if (-not $baselineZip) { throw "Legacy NoAds ZIP was not downloaded" }
+          Expand-Archive $baselineZip.FullName $baselineExpanded -Force
+          Expand-Archive $candidateZip $candidateExpanded -Force
+
+          $baselineMains = @(Get-ChildItem $baselineExpanded -Recurse -File -Filter "v2rayN.exe")
+          if ($baselineMains.Count -ne 1) {
+            throw "Legacy package must contain exactly one v2rayN.exe; found $($baselineMains.Count)"
+          }
+          $baselineRoot = $baselineMains[0].Directory.FullName
+          $legacyUpdater = Join-Path $baselineRoot "AmazTool.exe"
+          if (-not (Test-Path $legacyUpdater -PathType Leaf)) {
+            throw "Legacy AmazTool.exe is missing beside v2rayN.exe"
+          }
+          Copy-Item -Path (Join-Path $baselineRoot "*") -Destination $installRoot -Recurse -Force
+
+          $installedMain = Join-Path $installRoot "v2rayN.exe"
+          $installedUpdater = Join-Path $installRoot "AmazTool.exe"
+          Set-Content $installedMain "legacy-version-placeholder" -NoNewline
+
+          $candidateMains = @(Get-ChildItem $candidateExpanded -Recurse -File -Filter "v2rayN.exe")
+          if ($candidateMains.Count -ne 1) {
+            throw "Candidate package must contain exactly one v2rayN.exe; found $($candidateMains.Count)"
+          }
+          $candidateRoot = $candidateMains[0].Directory.FullName
+          $candidateUpdater = Join-Path $candidateRoot "AmazTool.exe"
+          $expectedMainHash = (Get-FileHash $candidateMains[0].FullName -Algorithm SHA256).Hash
+          $expectedUpdaterHash = (Get-FileHash $candidateUpdater -Algorithm SHA256).Hash
+          $legacyUpdaterHash = (Get-FileHash $installedUpdater -Algorithm SHA256).Hash
+
+          try {
+            $legacyProcess = Start-Process `
+              -FilePath $installedUpdater `
+              -ArgumentList ('"{0}"' -f (Resolve-Path $candidateZip).Path) `
+              -PassThru
+            if (-not $legacyProcess.WaitForExit(120000)) {
+              Stop-Process -Id $legacyProcess.Id -Force -ErrorAction SilentlyContinue
+              throw "Legacy AmazTool did not exit within 120 seconds"
+            }
+            if ($legacyProcess.ExitCode -ne 0) {
+              throw "Legacy AmazTool exited with code $($legacyProcess.ExitCode)"
+            }
+
+            $actualMainHash = (Get-FileHash $installedMain -Algorithm SHA256).Hash
+            $actualUpdaterHash = (Get-FileHash $installedUpdater -Algorithm SHA256).Hash
+            if ($actualMainHash -cne $expectedMainHash) {
+              throw "Legacy updater did not replace v2rayN.exe with the candidate"
+            }
+            if ($actualUpdaterHash -cne $expectedUpdaterHash) {
+              throw "Legacy updater did not replace AmazTool.exe with the candidate"
+            }
+            if ($actualUpdaterHash -ceq $legacyUpdaterHash) {
+              throw "AmazTool.exe was not upgraded from the legacy binary"
+            }
+
+            $version = (Get-Item $installedMain).VersionInfo.FileVersion
+            Write-Host "Legacy update source tag: $baselineTag"
+            Write-Host "Updated v2rayN file version: $version"
+            Write-Host "REAL_LEGACY_IN_PLACE_UPDATE=PASS"
+          }
+          finally {
+            $installedMainPath = [System.IO.Path]::GetFullPath($installedMain)
+            Get-Process -Name "v2rayN" -ErrorAction SilentlyContinue | ForEach-Object {
+              try {
+                if ([string]::Equals($_.MainModule.FileName, $installedMainPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $_.Id -Force
+                }
+              }
+              catch {
+                Write-Warning "Could not inspect or stop test process $($_.Id): $($_.Exception.Message)"
+              }
+            }
+          }
 
       - name: Upload verified package artifact
         if: steps.resolve.outputs.should_build == 'true'
@@ -549,6 +818,7 @@ jobs:
             "- 上游提交：$sourceSha",
             "- 构建平台：Windows x64 / self-contained",
             "- 包含：v2rayN.exe、AmazTool.exe、bin/",
+            "- 内置更新：兼容ZIP根目录或任意名称包装目录，替换失败返回明确错误码",
             "- 指南入口：https://guide.uutec.net/",
             "- 文件：$asset",
             "- 大小：$bytes bytes",
