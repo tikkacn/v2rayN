@@ -543,12 +543,13 @@ jobs:
           $bytes = "${{ steps.package.outputs.bytes }}"
 
           $notes = @(
-            "基于上游正式 Release 自动构建，已移除推广菜单。",
+            "基于上游正式 Release 自动构建，原推广入口已改为“通知 / 教程”。",
             "",
             "- 上游版本：$sourceTag",
             "- 上游提交：$sourceSha",
             "- 构建平台：Windows x64 / self-contained",
             "- 包含：v2rayN.exe、AmazTool.exe、bin/",
+            "- 指南入口：https://guide.uutec.net/",
             "- 文件：$asset",
             "- 大小：$bytes bytes",
             "- SHA-256：$sha256"
