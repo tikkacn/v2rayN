@@ -741,8 +741,11 @@ jobs:
             $legacyProcess = Start-Process `
               -FilePath $installedUpdater `
               -ArgumentList ('"{0}"' -f (Resolve-Path $candidateZip).Path) `
-              -PassThru `
-              -Wait
+              -PassThru
+            if (-not $legacyProcess.WaitForExit(120000)) {
+              Stop-Process -Id $legacyProcess.Id -Force -ErrorAction SilentlyContinue
+              throw "Legacy AmazTool did not exit within 120 seconds"
+            }
             if ($legacyProcess.ExitCode -ne 0) {
               throw "Legacy AmazTool exited with code $($legacyProcess.ExitCode)"
             }
@@ -815,6 +818,7 @@ jobs:
             "- 上游提交：$sourceSha",
             "- 构建平台：Windows x64 / self-contained",
             "- 包含：v2rayN.exe、AmazTool.exe、bin/",
+            "- 内置更新：兼容ZIP根目录或任意名称包装目录，替换失败返回明确错误码",
             "- 指南入口：https://guide.uutec.net/",
             "- 文件：$asset",
             "- 大小：$bytes bytes",
