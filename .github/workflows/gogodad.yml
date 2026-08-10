@@ -203,6 +203,31 @@ jobs:
           $mainCodeFile = "v2rayN\v2rayN.Desktop\Views\MainWindow.axaml.cs"
           $wpfXamlFile = "v2rayN\v2rayN\Views\MainWindow.xaml"
           $wpfCodeFile = "v2rayN\v2rayN\Views\MainWindow.xaml.cs"
+          $amazUpgradeFile = "v2rayN\AmazTool\UpgradeApp.cs"
+          $amazProgramFile = "v2rayN\AmazTool\Program.cs"
+
+          $updaterPatches = @(
+            @{
+              Source = "..\automation\patches\amaztool\UpgradeApp.cs"
+              Target = $amazUpgradeFile
+              UpstreamSha256 = "185f7939ba52fbb95084f91d72c2a6414853a7944103cdfd7801bf4e704166ba"
+            },
+            @{
+              Source = "..\automation\patches\amaztool\Program.cs"
+              Target = $amazProgramFile
+              UpstreamSha256 = "b437d8c2486ef81f78c447ef4fbfcc171e3fb6f4730b1aedeb5cdb461b0bbb92"
+            }
+          )
+          foreach ($patch in $updaterPatches) {
+            if (-not (Test-Path $patch.Source -PathType Leaf)) {
+              throw "Smart updater source is missing: $($patch.Source)"
+            }
+            $upstreamHash = (Get-FileHash $patch.Target -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($upstreamHash -cne $patch.UpstreamSha256) {
+              throw "Upstream AmazTool changed; review the smart updater before rebuilding: $($patch.Target)"
+            }
+            Copy-Item -Path $patch.Source -Destination $patch.Target -Force
+          }
 
           Replace-ExactlyOnce `
             -Path $globalFile `
@@ -371,10 +396,28 @@ jobs:
             throw "Guide portal integration is incomplete; found only $($guideMarkers.Count) markers"
           }
 
+          $smartUpdaterText = Get-Content $amazUpgradeFile -Raw -Encoding UTF8
+          $smartUpdaterMarkers = @(
+            'DetectArchiveRoot',
+            'ValidateArchive',
+            'GetSafeOutputPath',
+            'The update archive must contain exactly one v2rayN.exe',
+            'Failed to replace update file after retries'
+          )
+          foreach ($marker in $smartUpdaterMarkers) {
+            if (-not $smartUpdaterText.Contains($marker)) {
+              throw "Smart updater marker is missing: $marker"
+            }
+          }
+          $amazProgramText = Get-Content $amazProgramFile -Raw -Encoding UTF8
+          if (-not $amazProgramText.Contains('Environment.ExitCode = 1')) {
+            throw "AmazTool must expose a non-zero exit code on failure"
+          }
+
           git diff --check
           Write-Host "NoAds changes applied cleanly"
           git diff --stat
-          git diff -- $globalFile $coreInfoFile $updateServiceFile $resourceDesignerFile $mainXamlFile $mainCodeFile $wpfXamlFile $wpfCodeFile "v2rayN\ServiceLib\Resx"
+          git diff -- $globalFile $coreInfoFile $updateServiceFile $resourceDesignerFile $mainXamlFile $mainCodeFile $wpfXamlFile $wpfCodeFile $amazUpgradeFile $amazProgramFile "v2rayN\ServiceLib\Resx"
 
       - name: Restore
         if: steps.resolve.outputs.should_build == 'true'
@@ -418,6 +461,57 @@ jobs:
             -p:PublishTrimmed=true `
             -p:EnableWindowsTargeting=true `
             -o out\amaz
+
+      - name: Validate smart updater archive layouts
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $testRoot = "temp\updater-layout-tests"
+          if (Test-Path $testRoot) { Remove-Item $testRoot -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+
+          $rootLayout = Join-Path $testRoot "root-layout"
+          New-Item -ItemType Directory -Force -Path (Join-Path $rootLayout "bin\xray") | Out-Null
+          Set-Content (Join-Path $rootLayout "v2rayN.exe") "dummy-main" -NoNewline
+          Set-Content (Join-Path $rootLayout "AmazTool.exe") "dummy-updater" -NoNewline
+          Set-Content (Join-Path $rootLayout "bin\xray\xray.exe") "dummy-core" -NoNewline
+          $rootZip = Join-Path $testRoot "root-layout.zip"
+          Compress-Archive -Path "$rootLayout\*" -DestinationPath $rootZip -Force
+
+          $wrapperName = "customer-renamed-folder"
+          $wrapperLayout = Join-Path $testRoot $wrapperName
+          New-Item -ItemType Directory -Force -Path (Join-Path $wrapperLayout "bin\xray") | Out-Null
+          Set-Content (Join-Path $wrapperLayout "v2rayN.exe") "dummy-main" -NoNewline
+          Set-Content (Join-Path $wrapperLayout "AmazTool.exe") "dummy-updater" -NoNewline
+          Set-Content (Join-Path $wrapperLayout "bin\xray\xray.exe") "dummy-core" -NoNewline
+          $wrapperZip = Join-Path $testRoot "wrapper-layout.zip"
+          Compress-Archive -Path $wrapperLayout -DestinationPath $wrapperZip -Force
+
+          $amazTool = (Resolve-Path "out\amaz\AmazTool.exe").Path
+          $cases = @(
+            @{ Zip = (Resolve-Path $rootZip).Path; Layout = "Archive layout: files at ZIP root" },
+            @{ Zip = (Resolve-Path $wrapperZip).Path; Layout = "Archive layout: wrapper directory '$wrapperName'" }
+          )
+          foreach ($case in $cases) {
+            $output = @(& $amazTool validateupdate $case.Zip 2>&1)
+            $text = $output -join [Environment]::NewLine
+            Write-Host $text
+            $markers = @(
+              $case.Layout,
+              "-> v2rayN.exe",
+              "-> AmazTool.exe",
+              "-> bin/xray/xray.exe"
+            )
+            foreach ($marker in $markers) {
+              if (-not $text.Contains($marker)) {
+                throw "Smart updater validation output is missing: $marker"
+              }
+            }
+          }
 
       - name: Download exact upstream Windows package
         if: steps.resolve.outputs.should_build == 'true'
