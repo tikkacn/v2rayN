@@ -213,8 +213,8 @@ jobs:
           Replace-ExactlyOnce `
             -Path $globalFile `
             -Old '    public const string PromotionUrl = @"aHR0cHM6Ly85LjIzNDQ1Ni54eXovYWJjLmh0bWw=";' `
-            -New '' `
-            -Label "Promotion URL constant"
+            -New '    public const string GuidePortalUrl = @"https://guide.uutec.net/";' `
+            -Label "Guide portal URL"
 
           Replace-ExactlyOnce `
             -Path $coreInfoFile `
@@ -259,82 +259,103 @@ jobs:
           $updateText = [regex]::Replace($updateText, $desktopPattern, $desktopReplacement, 1)
           Set-Content $updateServiceFile $updateText -Encoding UTF8 -NoNewline
 
-          $xaml = Get-Content $mainXamlFile -Raw -Encoding UTF8
-          $menuPattern = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          if ([regex]::Matches($xaml, $menuPattern).Count -ne 1) {
-            throw "Promotion menu item expected exactly one match"
-          }
-          $xaml = [regex]::Replace($xaml, $menuPattern, '', 1)
-          Set-Content $mainXamlFile $xaml -Encoding UTF8 -NoNewline
+          Replace-ExactlyOnce `
+            -Path $mainXamlFile `
+            -Old '<MenuItem x:Name="menuPromotion" Header="{x:Static resx:ResUI.menuPromotion}" />' `
+            -New '<MenuItem x:Name="menuGuidePortal" Header="{x:Static resx:ResUI.menuGuidePortal}" />' `
+            -Label "Avalonia guide portal menu"
 
-          $code = Get-Content $mainCodeFile -Raw -Encoding UTF8
-          $clickPattern = '(?m)^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click;\s*\r?\n?'
-          if ([regex]::Matches($code, $clickPattern).Count -ne 1) {
-            throw "Promotion click handler registration expected exactly one match"
-          }
-          $code = [regex]::Replace($code, $clickPattern, '', 1)
+          Replace-ExactlyOnce `
+            -Path $mainCodeFile `
+            -Old '        menuPromotion.Click += MenuPromotion_Click;' `
+            -New '        menuGuidePortal.Click += MenuGuidePortal_Click;' `
+            -Label "Avalonia guide portal click registration"
 
-          $methodPattern = '(?ms)^\s*private void MenuPromotion_Click\([^)]*\)\s*\{.*?^\s*\}\s*'
-          if ([regex]::Matches($code, $methodPattern).Count -ne 1) {
-            throw "Promotion click handler method expected exactly one match"
-          }
-          $code = [regex]::Replace($code, $methodPattern, '', 1)
-          Set-Content $mainCodeFile $code -Encoding UTF8 -NoNewline
+          $oldAvaloniaMethod = @(
+            '    private void MenuPromotion_Click(object? sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart($"{Utils.Base64Decode(Global.PromotionUrl)}?t={DateTime.Now.Ticks}");',
+            '    }'
+          ) -join [Environment]::NewLine
+          $newAvaloniaMethod = @(
+            '    private void MenuGuidePortal_Click(object? sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart(Global.GuidePortalUrl);',
+            '    }'
+          ) -join [Environment]::NewLine
+          Replace-ExactlyOnce `
+            -Path $mainCodeFile `
+            -Old $oldAvaloniaMethod `
+            -New $newAvaloniaMethod `
+            -Label "Avalonia guide portal handler"
 
           $wpfXaml = Get-Content $wpfXamlFile -Raw -Encoding UTF8
-          $wpfMenuPattern = '(?ms)^\s*<Menu Margin="0,1" Style="\{StaticResource ToolbarMenu\}">\s*<MenuItem\s+x:Name="menuPromotion".*?</MenuItem>\s*</Menu>\s*<Separator\s*/>\s*'
-          if ([regex]::Matches($wpfXaml, $wpfMenuPattern).Count -ne 1) {
-            throw "Windows promotion menu block expected exactly one match"
+          $wpfMenuCount = ([regex]::Matches($wpfXaml, '\bmenuPromotion\b')).Count
+          if ($wpfMenuCount -ne 3) {
+            throw "Windows guide portal menu expected three promotion identifiers, found $wpfMenuCount"
           }
-          $wpfXaml = [regex]::Replace($wpfXaml, $wpfMenuPattern, '', 1)
+          $wpfXaml = $wpfXaml.Replace('menuPromotion', 'menuGuidePortal')
           Set-Content $wpfXamlFile $wpfXaml -Encoding UTF8 -NoNewline
 
-          $wpfCode = Get-Content $wpfCodeFile -Raw -Encoding UTF8
-          $wpfClickPattern = '(?m)^\s*menuPromotion\.Click\s*\+=\s*MenuPromotion_Click;\s*\r?\n?'
-          if ([regex]::Matches($wpfCode, $wpfClickPattern).Count -ne 1) {
-            throw "Windows promotion click handler registration expected exactly one match"
-          }
-          $wpfCode = [regex]::Replace($wpfCode, $wpfClickPattern, '', 1)
+          Replace-ExactlyOnce `
+            -Path $wpfCodeFile `
+            -Old '        menuPromotion.Click += MenuPromotion_Click;' `
+            -New '        menuGuidePortal.Click += MenuGuidePortal_Click;' `
+            -Label "Windows guide portal click registration"
 
-          $wpfMethodPattern = '(?ms)^\s*private void MenuPromotion_Click\([^)]*\)\s*\{.*?^\s*\}\s*'
-          if ([regex]::Matches($wpfCode, $wpfMethodPattern).Count -ne 1) {
-            throw "Windows promotion click handler method expected exactly one match"
-          }
-          $wpfCode = [regex]::Replace($wpfCode, $wpfMethodPattern, '', 1)
-          Set-Content $wpfCodeFile $wpfCode -Encoding UTF8 -NoNewline
+          $oldWpfMethod = @(
+            '    private void MenuPromotion_Click(object sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart($"{Utils.Base64Decode(Global.PromotionUrl)}?t={DateTime.Now.Ticks}");',
+            '    }'
+          ) -join [Environment]::NewLine
+          $newWpfMethod = @(
+            '    private void MenuGuidePortal_Click(object sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart(Global.GuidePortalUrl);',
+            '    }'
+          ) -join [Environment]::NewLine
+          Replace-ExactlyOnce `
+            -Path $wpfCodeFile `
+            -Old $oldWpfMethod `
+            -New $newWpfMethod `
+            -Label "Windows guide portal handler"
 
           $designer = Get-Content $resourceDesignerFile -Raw -Encoding UTF8
-          $designerCommentPattern = '(?ms)^\s*/// <summary>\s*///\s*查找类似 Promotion 的本地化字符串。\s*/// </summary>\s*(?=public static string menuPromotion)'
-          if ([regex]::Matches($designer, $designerCommentPattern).Count -ne 1) {
-            throw "Promotion resource designer comment expected exactly one match"
+          if (([regex]::Matches($designer, '\bmenuPromotion\b')).Count -ne 2) {
+            throw "Guide portal resource designer expected two promotion identifiers"
           }
-          $designer = [regex]::Replace($designer, $designerCommentPattern, '', 1)
-          $designerPropertyPattern = '(?ms)^\s*public static string menuPromotion\s*\{\s*get\s*\{\s*return ResourceManager\.GetString\("menuPromotion", resourceCulture\);\s*\}\s*\}\s*'
-          if ([regex]::Matches($designer, $designerPropertyPattern).Count -ne 1) {
-            throw "Promotion resource designer property expected exactly one match"
+          if (([regex]::Matches($designer, '查找类似 Promotion 的本地化字符串。')).Count -ne 1) {
+            throw "Guide portal resource designer comment expected one match"
           }
-          $designer = [regex]::Replace($designer, $designerPropertyPattern, '', 1)
+          $designer = $designer.Replace('menuPromotion', 'menuGuidePortal')
+          $designer = $designer.Replace('查找类似 Promotion 的本地化字符串。', '查找类似 Notices / Guides 的本地化字符串。')
           Set-Content $resourceDesignerFile $designer -Encoding UTF8 -NoNewline
 
-          $resourcePattern = '(?ms)^\s*<data name="menuPromotion" xml:space="preserve">\s*<value>.*?</value>\s*</data>\s*'
-          $resourceFiles = @(Get-ChildItem "v2rayN\ServiceLib\Resx" -File -Filter "ResUI*.resx" |
-            Where-Object { (Get-Content $_.FullName -Raw -Encoding UTF8) -match 'name="menuPromotion"' })
-          if ($resourceFiles.Count -eq 0) {
-            throw "No localized promotion resources were found"
+          $resourceLabels = @{
+            'ResUI.resx' = 'Notices / Guides'
+            'ResUI.fa.resx' = 'اطلاعیه‌ها / راهنماها'
+            'ResUI.fr.resx' = 'Annonces / Guides'
+            'ResUI.hu.resx' = 'Értesítések / Útmutatók'
+            'ResUI.id.resx' = 'Pengumuman / Panduan'
+            'ResUI.ru.resx' = 'Уведомления / Руководства'
+            'ResUI.zh-Hans.resx' = '通知 / 教程'
+            'ResUI.zh-Hant.resx' = '通知 / 教學'
           }
-          foreach ($resourceFile in $resourceFiles) {
-            $resourceText = Get-Content $resourceFile.FullName -Raw -Encoding UTF8
-            if ([regex]::Matches($resourceText, $resourcePattern).Count -ne 1) {
-              throw "Localized promotion resource expected exactly one match in $($resourceFile.FullName)"
+          $resourcePattern = '(?ms)(?<prefix><data name=")menuPromotion(?<middle>" xml:space="preserve">\s*<value>).*?(?<suffix></value>\s*</data>)'
+          $resourceRegex = [regex]::new($resourcePattern)
+          foreach ($resourceName in $resourceLabels.Keys) {
+            $resourcePath = Join-Path "v2rayN\ServiceLib\Resx" $resourceName
+            $resourceText = Get-Content $resourcePath -Raw -Encoding UTF8
+            if ($resourceRegex.Matches($resourceText).Count -ne 1) {
+              throw "Guide portal localized resource expected one match in $resourcePath"
             }
-            $resourceText = [regex]::Replace($resourceText, $resourcePattern, '', 1)
-            Set-Content $resourceFile.FullName $resourceText -Encoding UTF8 -NoNewline
-          }
-
-          $xamlCheck = Get-Content $mainXamlFile -Raw -Encoding UTF8
-          $codeCheck = Get-Content $mainCodeFile -Raw -Encoding UTF8
-          if ($xamlCheck -match '\bmenuPromotion\b' -or $codeCheck -match '\bmenuPromotion\b') {
-            throw "Promotion menu references still exist after patch"
+            $label = $resourceLabels[$resourceName]
+            $resourceText = $resourceRegex.Replace($resourceText, {
+              param($match)
+              return $match.Groups['prefix'].Value + 'menuGuidePortal' + $match.Groups['middle'].Value + $label + $match.Groups['suffix'].Value
+            }, 1)
+            Set-Content $resourcePath $resourceText -Encoding UTF8 -NoNewline
           }
 
           $promotionMarkers = @(Get-ChildItem "v2rayN" -Recurse -File -Include "*.cs", "*.xaml", "*.axaml", "*.resx" |
@@ -344,10 +365,16 @@ jobs:
             throw "Promotion source markers remain after patch: $($details -join '; ')"
           }
 
+          $guideMarkers = @(Get-ChildItem "v2rayN" -Recurse -File -Include "*.cs", "*.xaml", "*.axaml", "*.resx" |
+            Select-String -Pattern '\bmenuGuidePortal\b|\bGuidePortalUrl\b|https://guide\.uutec\.net/')
+          if ($guideMarkers.Count -lt 10) {
+            throw "Guide portal integration is incomplete; found only $($guideMarkers.Count) markers"
+          }
+
           git diff --check
           Write-Host "NoAds changes applied cleanly"
           git diff --stat
-          git diff -- $globalFile $coreInfoFile $updateServiceFile $mainXamlFile $mainCodeFile
+          git diff -- $globalFile $coreInfoFile $updateServiceFile $resourceDesignerFile $mainXamlFile $mainCodeFile $wpfXamlFile $wpfCodeFile "v2rayN\ServiceLib\Resx"
 
       - name: Restore
         if: steps.resolve.outputs.should_build == 'true'
