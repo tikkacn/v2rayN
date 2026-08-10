@@ -468,35 +468,48 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path dist\release | Out-Null
-          Copy-Item -Path out\app\* -Destination dist\release -Recurse -Force
+          $packageRootName = [System.IO.Path]::GetFileNameWithoutExtension($env:RELEASE_ASSET)
+          $packageRoot = Join-Path "dist" $packageRootName
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          Copy-Item -Path out\app\* -Destination $packageRoot -Recurse -Force
 
           $amazExe = Get-ChildItem -Path out\amaz -File -Filter "AmazTool.exe" -Recurse |
             Select-Object -First 1
           if (-not $amazExe) { throw "AmazTool.exe was not produced" }
-          Copy-Item -Path $amazExe.FullName -Destination dist\release\AmazTool.exe -Force
+          Copy-Item -Path $amazExe.FullName -Destination (Join-Path $packageRoot "AmazTool.exe") -Force
 
           $binDir = "${{ steps.upstream_bin.outputs.bin_dir }}"
           if (-not $binDir -or -not (Test-Path $binDir)) {
             throw "Verified upstream bin directory output is missing"
           }
-          Copy-Item -Path $binDir -Destination dist\release\bin -Recurse -Force
+          Copy-Item -Path $binDir -Destination (Join-Path $packageRoot "bin") -Recurse -Force
 
           $zipPath = Join-Path (Resolve-Path dist) $env:RELEASE_ASSET
-          Compress-Archive -Path dist\release\* -DestinationPath $zipPath -CompressionLevel Fastest -Force
+          # AmazTool removes the first path component from every ZIP entry during
+          # an in-app update. Keep exactly one wrapper directory, matching the
+          # official upstream packages, so v2rayN.exe and bin/ land correctly.
+          Compress-Archive -Path $packageRoot -DestinationPath $zipPath -CompressionLevel Fastest -Force
 
           $verifyDir = "dist\verify"
           New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
           Expand-Archive -Path $zipPath -DestinationPath $verifyDir -Force
 
+          $topLevelEntries = @(Get-ChildItem -Path $verifyDir -Force)
+          if ($topLevelEntries.Count -ne 1 -or
+              -not $topLevelEntries[0].PSIsContainer -or
+              $topLevelEntries[0].Name -cne $packageRootName) {
+            throw "Final ZIP must contain exactly one updater wrapper directory: $packageRootName"
+          }
+          $verifyRoot = Join-Path $verifyDir $packageRootName
+
           $requiredFiles = @(
-            (Join-Path $verifyDir "v2rayN.exe"),
-            (Join-Path $verifyDir "AmazTool.exe")
+            (Join-Path $verifyRoot "v2rayN.exe"),
+            (Join-Path $verifyRoot "AmazTool.exe")
           )
           foreach ($file in $requiredFiles) {
             if (-not (Test-Path $file -PathType Leaf)) { throw "Required file missing from final ZIP: $file" }
           }
-          $verifiedBin = Join-Path $verifyDir "bin"
+          $verifiedBin = Join-Path $verifyRoot "bin"
           if (-not (Test-Path $verifiedBin -PathType Container)) { throw "bin/ missing from final ZIP" }
           if (@(Get-ChildItem $verifiedBin -File -Recurse).Count -eq 0) { throw "bin/ is empty in final ZIP" }
 
