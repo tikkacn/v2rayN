@@ -555,6 +555,7 @@ jobs:
           if ($unsafeExitCode -ne 1 -or -not $unsafeText.Contains("Unsafe update path")) {
             throw "Smart updater did not reject a ZIP path traversal entry with exit code 1"
           }
+          $global:LASTEXITCODE = 0
 
       - name: Download exact upstream Windows package
         if: steps.resolve.outputs.should_build == 'true'

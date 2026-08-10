@@ -55,10 +55,13 @@ internal static class Program
             Environment.ExitCode = 1;
             Console.Error.WriteLine($"Upgrade failed with exit code {Environment.ExitCode}.");
             Console.Error.WriteLine(ex);
-            Console.WriteLine("Press any key to close this window...");
-            if (pauseOnError && !Console.IsInputRedirected)
+            if (pauseOnError)
             {
-                Console.ReadKey(true);
+                Console.WriteLine("Press any key to close this window...");
+                if (!Console.IsInputRedirected)
+                {
+                    Console.ReadKey(true);
+                }
             }
         }
     }
