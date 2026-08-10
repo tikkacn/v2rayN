@@ -663,6 +663,121 @@ jobs:
           Write-Host "Bytes: $size"
           Write-Host "SHA-256: $sha256"
 
+      - name: Validate real legacy in-place update
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $repo = $env:GITHUB_REPOSITORY
+          $targetTag = "${{ steps.resolve.outputs.release_tag }}"
+          $candidateZip = "${{ steps.package.outputs.zip }}"
+          $testRoot = "temp\legacy-update-integration"
+          if (Test-Path $testRoot) { Remove-Item $testRoot -Recurse -Force }
+          $baselineDownload = Join-Path $testRoot "baseline-download"
+          $baselineExpanded = Join-Path $testRoot "baseline-expanded"
+          $candidateExpanded = Join-Path $testRoot "candidate-expanded"
+          $installRoot = Join-Path $testRoot "customer-moved-installation"
+          New-Item -ItemType Directory -Force -Path $baselineDownload, $baselineExpanded, $candidateExpanded, $installRoot | Out-Null
+
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $targetTag --repo $repo *> $null
+          $targetReleaseExists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($targetReleaseExists) {
+            $baselineTag = $targetTag
+          }
+          else {
+            $baselineTag = gh release view --repo $repo --json tagName --jq .tagName
+            if ($LASTEXITCODE -ne 0 -or -not $baselineTag) {
+              throw "No previous NoAds release is available for legacy updater testing"
+            }
+          }
+
+          gh release download $baselineTag `
+            --repo $repo `
+            --pattern $env:RELEASE_ASSET `
+            --dir $baselineDownload `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download legacy package from $baselineTag" }
+
+          $baselineZip = Get-ChildItem $baselineDownload -File -Filter $env:RELEASE_ASSET |
+            Select-Object -First 1
+          if (-not $baselineZip) { throw "Legacy NoAds ZIP was not downloaded" }
+          Expand-Archive $baselineZip.FullName $baselineExpanded -Force
+          Expand-Archive $candidateZip $candidateExpanded -Force
+
+          $baselineMains = @(Get-ChildItem $baselineExpanded -Recurse -File -Filter "v2rayN.exe")
+          if ($baselineMains.Count -ne 1) {
+            throw "Legacy package must contain exactly one v2rayN.exe; found $($baselineMains.Count)"
+          }
+          $baselineRoot = $baselineMains[0].Directory.FullName
+          $legacyUpdater = Join-Path $baselineRoot "AmazTool.exe"
+          if (-not (Test-Path $legacyUpdater -PathType Leaf)) {
+            throw "Legacy AmazTool.exe is missing beside v2rayN.exe"
+          }
+          Copy-Item -Path (Join-Path $baselineRoot "*") -Destination $installRoot -Recurse -Force
+
+          $installedMain = Join-Path $installRoot "v2rayN.exe"
+          $installedUpdater = Join-Path $installRoot "AmazTool.exe"
+          Set-Content $installedMain "legacy-version-placeholder" -NoNewline
+
+          $candidateMains = @(Get-ChildItem $candidateExpanded -Recurse -File -Filter "v2rayN.exe")
+          if ($candidateMains.Count -ne 1) {
+            throw "Candidate package must contain exactly one v2rayN.exe; found $($candidateMains.Count)"
+          }
+          $candidateRoot = $candidateMains[0].Directory.FullName
+          $candidateUpdater = Join-Path $candidateRoot "AmazTool.exe"
+          $expectedMainHash = (Get-FileHash $candidateMains[0].FullName -Algorithm SHA256).Hash
+          $expectedUpdaterHash = (Get-FileHash $candidateUpdater -Algorithm SHA256).Hash
+          $legacyUpdaterHash = (Get-FileHash $installedUpdater -Algorithm SHA256).Hash
+
+          try {
+            $legacyProcess = Start-Process `
+              -FilePath $installedUpdater `
+              -ArgumentList ('"{0}"' -f (Resolve-Path $candidateZip).Path) `
+              -PassThru `
+              -Wait
+            if ($legacyProcess.ExitCode -ne 0) {
+              throw "Legacy AmazTool exited with code $($legacyProcess.ExitCode)"
+            }
+
+            $actualMainHash = (Get-FileHash $installedMain -Algorithm SHA256).Hash
+            $actualUpdaterHash = (Get-FileHash $installedUpdater -Algorithm SHA256).Hash
+            if ($actualMainHash -cne $expectedMainHash) {
+              throw "Legacy updater did not replace v2rayN.exe with the candidate"
+            }
+            if ($actualUpdaterHash -cne $expectedUpdaterHash) {
+              throw "Legacy updater did not replace AmazTool.exe with the candidate"
+            }
+            if ($actualUpdaterHash -ceq $legacyUpdaterHash) {
+              throw "AmazTool.exe was not upgraded from the legacy binary"
+            }
+
+            $version = (Get-Item $installedMain).VersionInfo.FileVersion
+            Write-Host "Legacy update source tag: $baselineTag"
+            Write-Host "Updated v2rayN file version: $version"
+            Write-Host "REAL_LEGACY_IN_PLACE_UPDATE=PASS"
+          }
+          finally {
+            $installedMainPath = [System.IO.Path]::GetFullPath($installedMain)
+            Get-Process -Name "v2rayN" -ErrorAction SilentlyContinue | ForEach-Object {
+              try {
+                if ([string]::Equals($_.MainModule.FileName, $installedMainPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                  Stop-Process -Id $_.Id -Force
+                }
+              }
+              catch {
+                Write-Warning "Could not inspect or stop test process $($_.Id): $($_.Exception.Message)"
+              }
+            }
+          }
+
       - name: Upload verified package artifact
         if: steps.resolve.outputs.should_build == 'true'
         uses: actions/upload-artifact@v7
