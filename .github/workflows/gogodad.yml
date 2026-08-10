@@ -4,458 +4,574 @@ on:
   workflow_dispatch:
     inputs:
       base_ref:
-        description: "上游原始 tag，不带 v，例如 7.22.3、7.22.4；自动跟随上游时不用管"
-        required: true
-        default: "7.22.4"
-        type: string
-      release_tag:
-        description: "你的 NoAds tag，带 v，例如 v7.22.3-NoAds；留空则自动用 v版本号-NoAds"
+        description: "上游正式 Release Tag，例如 7.24.4；留空则使用上游最新正式版"
         required: false
         default: ""
         type: string
+      release_tag:
+        description: "NoAds Release Tag；留空自动使用 v版本号-NoAds"
+        required: false
+        default: ""
+        type: string
+      force_rebuild:
+        description: "即使同版本资产已存在，也重新构建"
+        required: false
+        default: false
+        type: boolean
+      publish_release:
+        description: "构建成功后发布到 Releases"
+        required: false
+        default: true
+        type: boolean
   schedule:
-    - cron: "0 */6 * * *" # 每 6 小时检查一次（UTC）
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: sync-and-build-windows
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: 2dust/v2rayN
+  RELEASE_ASSET: v2rayN-windows-64-NoAds.zip
 
 jobs:
   sync_and_build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repo (with submodules)
-        uses: actions/checkout@v4
+      - name: Checkout automation repository
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-          submodules: recursive
+          path: automation
+          fetch-depth: 1
 
-      - name: Configure git
+      - name: Resolve upstream formal release
+        id: resolve
         shell: pwsh
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Fetch upstream
-        shell: pwsh
-        run: |
-          git remote add upstream https://github.com/2dust/v2rayN.git 2>$null
-          git fetch upstream --prune --tags
-          git remote set-head upstream -a
-
-      - name: Checkout manual base ref
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_BASE_REF: ${{ github.event.inputs.base_ref }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          INPUT_FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
         run: |
           $ErrorActionPreference = "Stop"
-          $baseRef = "${{ github.event.inputs.base_ref }}"
-          Write-Host "Manual base_ref: $baseRef"
 
-          if (git rev-parse --verify --quiet "refs/tags/$baseRef") {
-            git checkout --force "refs/tags/$baseRef"
-          } else {
-            throw "Cannot find base_ref: $baseRef"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "User-Agent" = "tikkacn-v2rayN-NoAds"
           }
 
-          git submodule update --init --recursive
+          $upstreamTag = $env:INPUT_BASE_REF.Trim()
+          if ([string]::IsNullOrWhiteSpace($upstreamTag)) {
+            $latest = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$env:UPSTREAM_REPO/releases/latest" `
+              -Headers $headers
+            $upstreamTag = [string]$latest.tag_name
+          }
 
-      - name: Detect upstream changes
-        id: diff
-        if: github.event_name == 'schedule'
+          if ([string]::IsNullOrWhiteSpace($upstreamTag)) {
+            throw "Cannot resolve upstream release tag"
+          }
+
+          $version = $upstreamTag.TrimStart("v")
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Unsupported upstream release tag: $upstreamTag"
+          }
+
+          $releaseTag = $env:INPUT_RELEASE_TAG.Trim()
+          if ([string]::IsNullOrWhiteSpace($releaseTag)) {
+            $releaseTag = "v$version-NoAds"
+          }
+
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$([uri]::EscapeDataString($releaseTag))"
+          $assetExists = $false
+          try {
+            $existing = Invoke-RestMethod -Uri $releaseUri -Headers $headers
+            $assetExists = @($existing.assets | Where-Object { $_.name -eq $env:RELEASE_ASSET }).Count -gt 0
+          }
+          catch {
+            $statusCode = 0
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+              $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            if ($statusCode -ne 404) { throw }
+          }
+
+          $forceRebuild = $env:INPUT_FORCE_REBUILD -eq "true"
+          $shouldBuild = $forceRebuild -or -not $assetExists
+
+          "upstream_tag=$upstreamTag" | Out-File $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
+          "release_tag=$releaseTag" | Out-File $env:GITHUB_OUTPUT -Append
+          "should_build=$($shouldBuild.ToString().ToLowerInvariant())" | Out-File $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Upstream formal release: $upstreamTag"
+          Write-Host "NoAds release tag: $releaseTag"
+          Write-Host "Existing asset: $assetExists"
+          Write-Host "Force rebuild: $forceRebuild"
+          Write-Host "Should build: $shouldBuild"
+
+      - name: No new formal release
+        if: steps.resolve.outputs.should_build != 'true'
         shell: pwsh
         run: |
-          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { throw "Cannot resolve upstream HEAD" }
-          $up = $upRef -replace '^refs/remotes/', ''
-          $behind = git rev-list --count "HEAD..$up"
-          "behind=$behind" | Out-File $env:GITHUB_OUTPUT -Append
-          Write-Host "Upstream ahead by $behind commits"
+          Write-Host "${{ steps.resolve.outputs.release_tag }} and $env:RELEASE_ASSET already exist; nothing to build."
 
-      - name: Exit if no upstream updates
-        if: github.event_name == 'schedule' && steps.diff.outputs.behind == '0'
-        shell: pwsh
-        run: |
-          Write-Host "No upstream updates. Exit."
-          exit 0
-
-      - name: Merge upstream & push
-        if: github.event_name == 'schedule'
-        shell: pwsh
-        run: |
-          $upRef = git symbolic-ref -q refs/remotes/upstream/HEAD
-          if (-not $upRef) { throw "Cannot resolve upstream HEAD" }
-          $up = $upRef -replace '^refs/remotes/', ''
-          git merge --no-edit $up
-          git push origin HEAD
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - name: Checkout exact upstream release with submodules
+        if: steps.resolve.outputs.should_build == 'true'
+        uses: actions/checkout@v7
         with:
-          dotnet-version: "8.0.x"
+          repository: 2dust/v2rayN
+          ref: ${{ steps.resolve.outputs.upstream_tag }}
+          path: source
+          submodules: recursive
+          fetch-depth: 1
 
-      - name: Apply NoAds self-update source
+      - name: Verify upstream source and submodules
+        if: steps.resolve.outputs.should_build == 'true'
+        id: source
         shell: pwsh
+        working-directory: source
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+
+          $submoduleStatus = @(git submodule status --recursive)
+          $badSubmodules = @($submoduleStatus | Where-Object { $_ -match '^[\-\+U]' })
+          if ($badSubmodules.Count -gt 0) {
+            throw "Submodule checkout does not match the upstream release: $($badSubmodules -join '; ')"
+          }
+
+          $props = Get-Content "v2rayN\Directory.Build.props" -Raw -Encoding UTF8
+          if ($props -notmatch '<Version>\s*([^<]+)\s*</Version>') {
+            throw "Cannot read Version from v2rayN/Directory.Build.props"
+          }
+          $sourceVersion = $Matches[1].Trim()
+          if ($sourceVersion -ne "${{ steps.resolve.outputs.version }}") {
+            throw "Tag/project version mismatch: tag=${{ steps.resolve.outputs.version }}, project=$sourceVersion"
+          }
+
+          $sourceSha = git rev-parse HEAD
+          "sha=$sourceSha" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Verified upstream source: $sourceSha"
+          $submoduleStatus | ForEach-Object { Write-Host $_ }
+
+      - name: Setup .NET 10
+        if: steps.resolve.outputs.should_build == 'true'
+        uses: actions/setup-dotnet@v6.0.0
+        with:
+          dotnet-version: 10.0.1xx
+
+      - name: Apply NoAds changes
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          function Replace-ExactlyOnce {
+            param(
+              [string]$Path,
+              [string]$Old,
+              [string]$New,
+              [string]$Label
+            )
+            $text = Get-Content $Path -Raw -Encoding UTF8
+            $count = ([regex]::Matches($text, [regex]::Escape($Old))).Count
+            if ($count -ne 1) {
+              throw "$Label expected exactly one match in $Path, found $count"
+            }
+            $text = $text.Replace($Old, $New)
+            Set-Content $Path $text -Encoding UTF8 -NoNewline
+          }
 
           $globalFile = "v2rayN\ServiceLib\Global.cs"
           $coreInfoFile = "v2rayN\ServiceLib\Manager\CoreInfoManager.cs"
           $updateServiceFile = "v2rayN\ServiceLib\Services\UpdateService.cs"
+          $resourceDesignerFile = "v2rayN\ServiceLib\Resx\ResUI.Designer.cs"
+          $mainXamlFile = "v2rayN\v2rayN.Desktop\Views\MainWindow.axaml"
+          $mainCodeFile = "v2rayN\v2rayN.Desktop\Views\MainWindow.axaml.cs"
+          $wpfXamlFile = "v2rayN\v2rayN\Views\MainWindow.xaml"
+          $wpfCodeFile = "v2rayN\v2rayN\Views\MainWindow.xaml.cs"
 
-          $g = Get-Content $globalFile -Raw -Encoding UTF8
-          $g = $g -replace '\{ ECoreType\.v2rayN,\s*"2dust/v2rayN"\s*\},', '{ ECoreType.v2rayN, "tikkacn/v2rayN" },'
-          Set-Content $globalFile $g -Encoding UTF8
+          Replace-ExactlyOnce `
+            -Path $globalFile `
+            -Old '{ ECoreType.v2rayN, "2dust/v2rayN" },' `
+            -New '{ ECoreType.v2rayN, "tikkacn/v2rayN" },' `
+            -Label "Self-update repository"
 
-          $c = Get-Content $coreInfoFile -Raw -Encoding UTF8
-          $c = $c -replace 'v2rayN-windows-64\.zip', 'v2rayN-windows-64-NoAds.zip'
-          $c = $c -replace '/download/\{0\}/v2rayN-windows-64-NoAds\.zip', '/download/v{0}-NoAds/v2rayN-windows-64-NoAds.zip'
-          $c = $c -replace '/download/v\{0\}/v2rayN-windows-64-NoAds\.zip', '/download/v{0}-NoAds/v2rayN-windows-64-NoAds.zip'
-          Set-Content $coreInfoFile $c -Encoding UTF8
+          Replace-ExactlyOnce `
+            -Path $globalFile `
+            -Old '    public const string PromotionUrl = @"aHR0cHM6Ly85LjIzNDQ1Ni54eXovYWJjLmh0bWw=";' `
+            -New '    public const string GuidePortalUrl = @"https://guide.uutec.net/";' `
+            -Label "Guide portal URL"
 
-          $u = Get-Content $updateServiceFile -Raw -Encoding UTF8
+          Replace-ExactlyOnce `
+            -Path $coreInfoFile `
+            -Old '/download/{0}/v2rayN-windows-64.zip' `
+            -New '/download/v{0}-NoAds/v2rayN-windows-64-NoAds.zip' `
+            -Label "NoAds download asset"
 
-          $oldVersionReturn = 'return new UpdateResult(true, new SemanticVersion(tagName));'
+          $oldVersionReturn = '        return new UpdateResult(true, new SemanticVersion(tagName));'
           $newVersionReturn = @(
-              '        if (type == ECoreType.v2rayN && tagName?.EndsWith("-NoAds", StringComparison.OrdinalIgnoreCase) == true)',
-              '        {',
-              '            tagName = tagName[..^"-NoAds".Length];',
-              '        }',
-              '',
-              '        return new UpdateResult(true, new SemanticVersion(tagName));'
+            '        if (type == ECoreType.v2rayN && tagName?.EndsWith("-NoAds", StringComparison.OrdinalIgnoreCase) == true)',
+            '        {',
+            '            tagName = tagName[..^"-NoAds".Length];',
+            '        }',
+            '',
+            '        return new UpdateResult(true, new SemanticVersion(tagName));'
           ) -join [Environment]::NewLine
 
-          if (-not $u.Contains($oldVersionReturn)) {
-              throw "UpdateService.cs version return block not found"
+          Replace-ExactlyOnce `
+            -Path $updateServiceFile `
+            -Old $oldVersionReturn `
+            -New $newVersionReturn `
+            -Label "NoAds semantic-version normalization"
+
+          $updateText = Get-Content $updateServiceFile -Raw -Encoding UTF8
+          $desktopPattern = '(?s)(?<indent>[ \t]*)if\s*\(\s*File\.Exists\(Path\.Combine\(Utils\.GetBaseDirectory\(\),\s*"libHarfBuzzSharp\.dll"\)\)\s*\)\s*\{\s*return\s+url\?\.Replace\("\.zip",\s*"-desktop\.zip"\);\s*\}'
+          $desktopMatches = [regex]::Matches($updateText, $desktopPattern)
+          if ($desktopMatches.Count -ne 1) {
+            throw "Desktop asset rename block expected exactly one match, found $($desktopMatches.Count)"
           }
-
-          $u = $u.Replace($oldVersionReturn, $newVersionReturn)
-
-          $patternDesktop = '(?s)(?<indent>[ \t]*)if\s*\(\s*File\.Exists\(Path\.Combine\(Utils\.GetBaseDirectory\(\),\s*"libHarfBuzzSharp\.dll"\)\)\s*\)\s*\{\s*return\s+url\?\.Replace\("\.zip",\s*"-desktop\.zip"\);\s*\}'
-
-          $matchDesktop = [regex]::Match($u, $patternDesktop)
-          if (-not $matchDesktop.Success) {
-              throw "UpdateService.cs desktop rename block not found"
-          }
-
-          $indent = $matchDesktop.Groups["indent"].Value
-
-          $replacementDesktop = @(
-              "${indent}if (url?.Contains(""v2rayN-windows-64-NoAds.zip"", StringComparison.OrdinalIgnoreCase) == true)",
-              "${indent}{",
-              "${indent}    return url;",
-              "${indent}}",
-              "",
-              "${indent}if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), ""libHarfBuzzSharp.dll"")))",
-              "${indent}{",
-              "${indent}    return url?.Replace("".zip"", ""-desktop.zip"");",
-              "${indent}}"
+          $indent = $desktopMatches[0].Groups["indent"].Value
+          $desktopReplacement = @(
+            "${indent}if (url?.Contains(""v2rayN-windows-64-NoAds.zip"", StringComparison.OrdinalIgnoreCase) == true)",
+            "${indent}{",
+            "${indent}    return url;",
+            "${indent}}",
+            "",
+            "${indent}if (File.Exists(Path.Combine(Utils.GetBaseDirectory(), ""libHarfBuzzSharp.dll"")))",
+            "${indent}{",
+            "${indent}    return url?.Replace("".zip"", ""-desktop.zip"");",
+            "${indent}}"
           ) -join [Environment]::NewLine
+          $updateText = [regex]::Replace($updateText, $desktopPattern, $desktopReplacement, 1)
+          Set-Content $updateServiceFile $updateText -Encoding UTF8 -NoNewline
 
-          $u = [regex]::Replace($u, $patternDesktop, $replacementDesktop, 1)
-          Set-Content $updateServiceFile $u -Encoding UTF8
+          Replace-ExactlyOnce `
+            -Path $mainXamlFile `
+            -Old '<MenuItem x:Name="menuPromotion" Header="{x:Static resx:ResUI.menuPromotion}" />' `
+            -New '<MenuItem x:Name="menuGuidePortal" Header="{x:Static resx:ResUI.menuGuidePortal}" />' `
+            -Label "Avalonia guide portal menu"
 
-          Write-Host "✅ v2rayN self-update source set to tikkacn/v2rayN"
-          Write-Host "✅ v2rayN self-update asset set to v2rayN-windows-64-NoAds.zip"
-          Write-Host "✅ NoAds release tag will be normalized for version comparison"
-          Write-Host "✅ NoAds package will not be renamed to -desktop.zip"
+          Replace-ExactlyOnce `
+            -Path $mainCodeFile `
+            -Old '        menuPromotion.Click += MenuPromotion_Click;' `
+            -New '        menuGuidePortal.Click += MenuGuidePortal_Click;' `
+            -Label "Avalonia guide portal click registration"
 
-      - name: Locate MainWindow axaml & code-behind
-        id: locate_mainwindow
-        shell: pwsh
-        run: |
-          $axaml = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml" |
-            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml$" } |
-            Select-Object -First 1
-          if (-not $axaml) { throw "MainWindow.axaml not found" }
+          $oldAvaloniaMethod = @(
+            '    private void MenuPromotion_Click(object? sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart($"{Utils.Base64Decode(Global.PromotionUrl)}?t={DateTime.Now.Ticks}");',
+            '    }'
+          ) -join [Environment]::NewLine
+          $newAvaloniaMethod = @(
+            '    private void MenuGuidePortal_Click(object? sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart(Global.GuidePortalUrl);',
+            '    }'
+          ) -join [Environment]::NewLine
+          Replace-ExactlyOnce `
+            -Path $mainCodeFile `
+            -Old $oldAvaloniaMethod `
+            -New $newAvaloniaMethod `
+            -Label "Avalonia guide portal handler"
 
-          $cs = Get-ChildItem -Recurse -File -Filter "MainWindow.axaml.cs" |
-            Where-Object { $_.FullName -match "v2rayN\.Desktop\\Views\\MainWindow\.axaml\.cs$" } |
-            Select-Object -First 1
-          if (-not $cs) { throw "MainWindow.axaml.cs not found" }
-
-          "axaml=$($axaml.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-          "cs=$($cs.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-
-      - name: Remove Promotion menu item (XAML) + Fix code-behind references (robust) + Guard
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $axaml = "${{ steps.locate_mainwindow.outputs.axaml }}"
-          $cs    = "${{ steps.locate_mainwindow.outputs.cs }}"
-
-          # 1) Remove menuPromotion from XAML
-          $x = Get-Content $axaml -Raw -Encoding UTF8
-          $patternLine = '(?m)^\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*\r?\n?'
-          $x2 = [regex]::Replace($x, $patternLine, '')
-
-          if ($x2 -eq $x) {
-            $patternAny = '\s*<MenuItem\b[^>]*\bx:Name\s*=\s*"menuPromotion"[^>]*/>\s*'
-            $x2 = [regex]::Replace($x, $patternAny, '')
+          $wpfXaml = Get-Content $wpfXamlFile -Raw -Encoding UTF8
+          $wpfMenuCount = ([regex]::Matches($wpfXaml, '\bmenuPromotion\b')).Count
+          if ($wpfMenuCount -ne 3) {
+            throw "Windows guide portal menu expected three promotion identifiers, found $wpfMenuCount"
           }
+          $wpfXaml = $wpfXaml.Replace('menuPromotion', 'menuGuidePortal')
+          Set-Content $wpfXamlFile $wpfXaml -Encoding UTF8 -NoNewline
 
-          if ($x2 -eq $x) { throw "menuPromotion not removed from XAML (pattern not matched)" }
+          Replace-ExactlyOnce `
+            -Path $wpfCodeFile `
+            -Old '        menuPromotion.Click += MenuPromotion_Click;' `
+            -New '        menuGuidePortal.Click += MenuGuidePortal_Click;' `
+            -Label "Windows guide portal click registration"
 
-          Set-Content $axaml $x2 -Encoding UTF8
-          $xCheck = Get-Content $axaml -Raw -Encoding UTF8
-          if ($xCheck -match 'x:Name\s*=\s*"menuPromotion"') { throw "menuPromotion still exists in XAML after edit" }
-          Write-Host "✅ menuPromotion removed from XAML"
+          $oldWpfMethod = @(
+            '    private void MenuPromotion_Click(object sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart($"{Utils.Base64Decode(Global.PromotionUrl)}?t={DateTime.Now.Ticks}");',
+            '    }'
+          ) -join [Environment]::NewLine
+          $newWpfMethod = @(
+            '    private void MenuGuidePortal_Click(object sender, RoutedEventArgs e)',
+            '    {',
+            '        ProcUtils.ProcessStart(Global.GuidePortalUrl);',
+            '    }'
+          ) -join [Environment]::NewLine
+          Replace-ExactlyOnce `
+            -Path $wpfCodeFile `
+            -Old $oldWpfMethod `
+            -New $newWpfMethod `
+            -Label "Windows guide portal handler"
 
-          # 2) Remove menuPromotion references from code-behind
-          $c = Get-Content $cs -Raw -Encoding UTF8
-          $c2 = [regex]::Replace($c, '(?m)^\s*.*\bmenuPromotion\b.*\r?\n', '')
-          $c2 = [regex]::Replace($c2, '(?ms)^\s*.*\bmenuPromotion\b.*(?:\r?\n\s*.*){0,6}', '')
-
-          if ($c2 -ne $c) {
-            Set-Content $cs $c2 -Encoding UTF8
-            Write-Host "✅ menuPromotion references removed from code-behind"
-          } else {
-            Write-Host "ℹ️ No menuPromotion references removed (pattern changed or not present)"
+          $designer = Get-Content $resourceDesignerFile -Raw -Encoding UTF8
+          if (([regex]::Matches($designer, '\bmenuPromotion\b')).Count -ne 2) {
+            throw "Guide portal resource designer expected two promotion identifiers"
           }
+          if (([regex]::Matches($designer, '查找类似 Promotion 的本地化字符串。')).Count -ne 1) {
+            throw "Guide portal resource designer comment expected one match"
+          }
+          $designer = $designer.Replace('menuPromotion', 'menuGuidePortal')
+          $designer = $designer.Replace('查找类似 Promotion 的本地化字符串。', '查找类似 Notices / Guides 的本地化字符串。')
+          Set-Content $resourceDesignerFile $designer -Encoding UTF8 -NoNewline
 
-          $final = Get-Content $cs -Raw -Encoding UTF8
-          if ($final -match '\bmenuPromotion\b') { throw "menuPromotion still referenced in MainWindow.axaml.cs after cleanup" }
-
-      - name: Locate v2rayN.Desktop.csproj
-        id: locate_csproj
-        shell: pwsh
-        run: |
-          $csproj = Get-ChildItem -Recurse -File -Filter "v2rayN.Desktop.csproj" | Select-Object -First 1
-          if (-not $csproj) { throw "v2rayN.Desktop.csproj not found" }
-          "csproj=$($csproj.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-
-      - name: Detect version (from upstream project files)
-        id: ver
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # Try common version sources (keep it robust)
-          $candidates = @(
-            "Directory.Build.props",
-            "v2rayN\Directory.Build.props",
-            "v2rayN\Directory.Build.targets",
-            "Directory.Build.targets"
-          )
-
-          $version = $null
-          foreach ($p in $candidates) {
-            if (Test-Path $p) {
-              $txt = Get-Content $p -Raw -Encoding UTF8
-              if ($txt -match '<Version>\s*([^<]+)\s*</Version>') { $version = $Matches[1].Trim(); break }
+          $resourceLabels = @{
+            'ResUI.resx' = 'Notices / Guides'
+            'ResUI.fa.resx' = 'اطلاعیه‌ها / راهنماها'
+            'ResUI.fr.resx' = 'Annonces / Guides'
+            'ResUI.hu.resx' = 'Értesítések / Útmutatók'
+            'ResUI.id.resx' = 'Pengumuman / Panduan'
+            'ResUI.ru.resx' = 'Уведомления / Руководства'
+            'ResUI.zh-Hans.resx' = '通知 / 教程'
+            'ResUI.zh-Hant.resx' = '通知 / 教學'
+          }
+          $resourcePattern = '(?ms)(?<prefix><data name=")menuPromotion(?<middle>" xml:space="preserve">\s*<value>).*?(?<suffix></value>\s*</data>)'
+          $resourceRegex = [regex]::new($resourcePattern)
+          foreach ($resourceName in $resourceLabels.Keys) {
+            $resourcePath = Join-Path "v2rayN\ServiceLib\Resx" $resourceName
+            $resourceText = Get-Content $resourcePath -Raw -Encoding UTF8
+            if ($resourceRegex.Matches($resourceText).Count -ne 1) {
+              throw "Guide portal localized resource expected one match in $resourcePath"
             }
+            $label = $resourceLabels[$resourceName]
+            $resourceText = $resourceRegex.Replace($resourceText, {
+              param($match)
+              return $match.Groups['prefix'].Value + 'menuGuidePortal' + $match.Groups['middle'].Value + $label + $match.Groups['suffix'].Value
+            }, 1)
+            Set-Content $resourcePath $resourceText -Encoding UTF8 -NoNewline
           }
 
-          if (-not $version) {
-            # Fallback: search any *.csproj for <Version>
-            $proj = Get-ChildItem -Recurse -File -Filter "*.csproj" | Select-Object -First 50
-            foreach ($f in $proj) {
-              $txt = Get-Content $f.FullName -Raw -Encoding UTF8
-              if ($txt -match '<Version>\s*([^<]+)\s*</Version>') { $version = $Matches[1].Trim(); break }
-            }
+          $promotionMarkers = @(Get-ChildItem "v2rayN" -Recurse -File -Include "*.cs", "*.xaml", "*.axaml", "*.resx" |
+            Select-String -Pattern '\bmenuPromotion\b|\bPromotionUrl\b|aHR0cHM6Ly85LjIzNDQ1Ni54eXovYWJjLmh0bWw=')
+          if ($promotionMarkers.Count -gt 0) {
+            $details = $promotionMarkers | ForEach-Object { "$($_.Path):$($_.LineNumber):$($_.Line.Trim())" }
+            throw "Promotion source markers remain after patch: $($details -join '; ')"
           }
 
-          if (-not $version) { throw "Cannot find <Version> in props/csproj" }
-
-          $manualTag = "${{ github.event.inputs.release_tag }}"
-          if ("${{ github.event_name }}" -eq "workflow_dispatch" -and -not [string]::IsNullOrWhiteSpace($manualTag)) {
-            $tag = $manualTag
-          } else {
-            $tag = "v$version-NoAds"
+          $guideMarkers = @(Get-ChildItem "v2rayN" -Recurse -File -Include "*.cs", "*.xaml", "*.axaml", "*.resx" |
+            Select-String -Pattern '\bmenuGuidePortal\b|\bGuidePortalUrl\b|https://guide\.uutec\.net/')
+          if ($guideMarkers.Count -lt 10) {
+            throw "Guide portal integration is incomplete; found only $($guideMarkers.Count) markers"
           }
 
-          $title = "v2rayN $version 去广告版 (NoAds)"
-
-          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
-          "tag=$tag"         | Out-File $env:GITHUB_OUTPUT -Append
-          "title=$title"     | Out-File $env:GITHUB_OUTPUT -Append
-
-          Write-Host "version=$version"
-          Write-Host "tag=$tag"
-          Write-Host "title=$title"
+          git diff --check
+          Write-Host "NoAds changes applied cleanly"
+          git diff --stat
+          git diff -- $globalFile $coreInfoFile $updateServiceFile $resourceDesignerFile $mainXamlFile $mainCodeFile $wpfXamlFile $wpfCodeFile "v2rayN\ServiceLib\Resx"
 
       - name: Restore
+        if: steps.resolve.outputs.should_build == 'true'
         shell: pwsh
-        run: |
-          dotnet restore "${{ steps.locate_csproj.outputs.csproj }}"
-
-      - name: Publish v2rayN Desktop (win-x64, self-contained)
-        shell: pwsh
+        working-directory: source
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          dotnet restore "v2rayN\v2rayN.Desktop\v2rayN.Desktop.csproj"
+
+      - name: Publish v2rayN Desktop (win-x64, self-contained)
+        if: steps.resolve.outputs.should_build == 'true'
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
 
           if (Test-Path out) { Remove-Item out -Recurse -Force }
           New-Item -ItemType Directory -Force -Path out | Out-Null
 
-          dotnet publish "${{ steps.locate_csproj.outputs.csproj }}" `
+          dotnet publish "v2rayN\v2rayN.Desktop\v2rayN.Desktop.csproj" `
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
+            -p:EnableWindowsTargeting=true `
             -o out\app
 
       - name: Publish AmazTool (win-x64, self-contained)
+        if: steps.resolve.outputs.should_build == 'true'
         shell: pwsh
+        working-directory: source
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
 
-          $proj = Get-ChildItem -Recurse -File -Filter "AmazTool.csproj" | Select-Object -First 1
-          if (-not $proj) { throw "AmazTool.csproj not found" }
-
-          dotnet publish "$($proj.FullName)" `
+          dotnet publish "v2rayN\AmazTool\AmazTool.csproj" `
             -c Release `
             -r win-x64 `
             -p:SelfContained=true `
+            -p:PublishTrimmed=true `
+            -p:EnableWindowsTargeting=true `
             -o out\amaz
 
-      - name: Download upstream official zip & extract bin (use gh release download)
+      - name: Download exact upstream Windows package
+        if: steps.resolve.outputs.should_build == 'true'
         id: upstream_bin
         shell: pwsh
+        working-directory: source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
 
-          $ver  = "${{ steps.ver.outputs.version }}"
-          $repo = "2dust/v2rayN"
-          $assetWanted = "v2rayN-windows-64.zip"
+          $tag = "${{ steps.resolve.outputs.upstream_tag }}"
+          $asset = "v2rayN-windows-64.zip"
 
           if (Test-Path temp) { Remove-Item temp -Recurse -Force }
           New-Item -ItemType Directory -Force -Path temp\up | Out-Null
 
-          $tagCandidates = @("v$ver", $ver, "latest")
-          $ok = $false
-          $usedTag = $null
+          gh release download $tag `
+            --repo $env:UPSTREAM_REPO `
+            --pattern $asset `
+            --dir temp\up
 
-          foreach ($t in $tagCandidates) {
-            try {
-              if ($t -eq "latest") {
-                Write-Host "=== Try upstream latest ==="
-                gh release download --repo $repo --pattern $assetWanted --dir temp\up
-                $usedTag = "latest"
-              } else {
-                Write-Host "=== Try upstream tag: $t ==="
-                gh release download $t --repo $repo --pattern $assetWanted --dir temp\up
-                $usedTag = $t
-              }
-
-              $zipPath = Join-Path "temp\up" $assetWanted
-              if (-not (Test-Path $zipPath)) { throw "Downloaded but zip not found at $zipPath" }
-
-              if (Test-Path temp\ex) { Remove-Item temp\ex -Recurse -Force }
-              New-Item -ItemType Directory -Force -Path temp\ex | Out-Null
-              Expand-Archive -Path $zipPath -DestinationPath temp\ex -Force
-
-              # Find any directory named "bin" inside extracted tree
-              $binDir = Get-ChildItem -Path temp\ex -Directory -Recurse -Force |
-                Where-Object { $_.Name -ieq "bin" } |
-                Select-Object -First 1
-
-              if (-not $binDir) { throw "Zip extracted but bin/ not found inside" }
-
-              Write-Host "✅ Found bin: $($binDir.FullName)"
-              "bin_dir=$($binDir.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
-              "up_tag=$usedTag"             | Out-File $env:GITHUB_OUTPUT -Append
-              "up_asset=$assetWanted"       | Out-File $env:GITHUB_OUTPUT -Append
-
-              $ok = $true
-              break
-            } catch {
-              Write-Host "Try $t failed: $($_.Exception.Message)"
-              # Clean possible partial download
-              Remove-Item temp\up\* -Force -ErrorAction SilentlyContinue
-            }
+          $zipPath = Join-Path "temp\up" $asset
+          if (-not (Test-Path $zipPath)) {
+            throw "Upstream package not found after download: $zipPath"
           }
 
-          if (-not $ok) {
-            throw "Cannot fetch upstream bin/ from $assetWanted for version=$ver (tried: $($tagCandidates -join ', '))."
+          New-Item -ItemType Directory -Force -Path temp\ex | Out-Null
+          Expand-Archive -Path $zipPath -DestinationPath temp\ex -Force
+
+          $binDir = Get-ChildItem -Path temp\ex -Directory -Recurse -Force |
+            Where-Object { $_.Name -ieq "bin" } |
+            Select-Object -First 1
+          if (-not $binDir) {
+            throw "The exact upstream package does not contain bin/"
           }
 
-      - name: Assemble release folder (ensure AmazTool.exe + bin)
-        id: pack
+          "bin_dir=$($binDir.FullName)" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Verified upstream bin directory: $($binDir.FullName)"
+
+      - name: Assemble and validate NoAds package
+        if: steps.resolve.outputs.should_build == 'true'
+        id: package
         shell: pwsh
+        working-directory: source
         run: |
           $ErrorActionPreference = "Stop"
 
           if (Test-Path dist) { Remove-Item dist -Recurse -Force }
           New-Item -ItemType Directory -Force -Path dist\release | Out-Null
-
-          # Copy main app output
           Copy-Item -Path out\app\* -Destination dist\release -Recurse -Force
 
-          # Ensure AmazTool.exe at root
-          $amazExe = Get-ChildItem -Path out\amaz -File -Filter "AmazTool.exe" -Recurse | Select-Object -First 1
-          if (-not $amazExe) { throw "AmazTool.exe not found in out\amaz" }
+          $amazExe = Get-ChildItem -Path out\amaz -File -Filter "AmazTool.exe" -Recurse |
+            Select-Object -First 1
+          if (-not $amazExe) { throw "AmazTool.exe was not produced" }
           Copy-Item -Path $amazExe.FullName -Destination dist\release\AmazTool.exe -Force
 
-          # Ensure bin folder
           $binDir = "${{ steps.upstream_bin.outputs.bin_dir }}"
-          if (-not $binDir -or -not (Test-Path $binDir)) { throw "bin_dir output missing or not exists" }
-
-          if (Test-Path dist\release\bin) { Remove-Item dist\release\bin -Recurse -Force }
+          if (-not $binDir -or -not (Test-Path $binDir)) {
+            throw "Verified upstream bin directory output is missing"
+          }
           Copy-Item -Path $binDir -Destination dist\release\bin -Recurse -Force
 
-          # Make final zip (single)
-          $zipName = "v2rayN-windows-64-NoAds.zip"
-          $zipPath = Join-Path "dist" $zipName
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path dist\release\* -DestinationPath $zipPath -Force
+          $zipPath = Join-Path (Resolve-Path dist) $env:RELEASE_ASSET
+          Compress-Archive -Path dist\release\* -DestinationPath $zipPath -CompressionLevel Fastest -Force
+
+          $verifyDir = "dist\verify"
+          New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+          Expand-Archive -Path $zipPath -DestinationPath $verifyDir -Force
+
+          $requiredFiles = @(
+            (Join-Path $verifyDir "v2rayN.exe"),
+            (Join-Path $verifyDir "AmazTool.exe")
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file -PathType Leaf)) { throw "Required file missing from final ZIP: $file" }
+          }
+          $verifiedBin = Join-Path $verifyDir "bin"
+          if (-not (Test-Path $verifiedBin -PathType Container)) { throw "bin/ missing from final ZIP" }
+          if (@(Get-ChildItem $verifiedBin -File -Recurse).Count -eq 0) { throw "bin/ is empty in final ZIP" }
+
+          $size = (Get-Item $zipPath).Length
+          if ($size -lt 10000000) { throw "Final ZIP is unexpectedly small: $size bytes" }
+          $sha256 = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
           "zip=$zipPath" | Out-File $env:GITHUB_OUTPUT -Append
-          "asset_name=$zipName" | Out-File $env:GITHUB_OUTPUT -Append
+          "sha256=$sha256" | Out-File $env:GITHUB_OUTPUT -Append
+          "bytes=$size" | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host "✅ ZIP: $zipPath"
+          Write-Host "Final ZIP: $zipPath"
+          Write-Host "Bytes: $size"
+          Write-Host "SHA-256: $sha256"
 
-      - name: Upload artifact (single full zip)
-        uses: actions/upload-artifact@v4
+      - name: Upload verified package artifact
+        if: steps.resolve.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
         with:
-          name: v2rayN-windows-64-NoAds.zip
-          path: ${{ steps.pack.outputs.zip }}
+          name: v2rayN-windows-64-NoAds
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Create/Update GitHub Release (single full zip, delete old asset to avoid 422)
+      - name: Create or update NoAds release
+        if: >-
+          steps.resolve.outputs.should_build == 'true' &&
+          (github.event_name == 'schedule' || github.event.inputs.publish_release == 'true')
         shell: pwsh
+        working-directory: source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $repo  = "${{ github.repository }}"
-          $tag   = "${{ steps.ver.outputs.tag }}"
-          $title = "${{ steps.ver.outputs.title }}"
-          $zip   = "${{ steps.pack.outputs.zip }}"
-          $asset = "${{ steps.pack.outputs.asset_name }}"
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = "${{ steps.resolve.outputs.release_tag }}"
+          $title = "v2rayN ${{ steps.resolve.outputs.version }} 去广告版 (NoAds)"
+          $zip = "${{ steps.package.outputs.zip }}"
+          $asset = $env:RELEASE_ASSET
+          $sourceTag = "${{ steps.resolve.outputs.upstream_tag }}"
+          $sourceSha = "${{ steps.source.outputs.sha }}"
+          $sha256 = "${{ steps.package.outputs.sha256 }}"
+          $bytes = "${{ steps.package.outputs.bytes }}"
 
-          $upTag   = "${{ steps.upstream_bin.outputs.up_tag }}"
-          $upAsset = "${{ steps.upstream_bin.outputs.up_asset }}"
-
-          # notes as array (NO here-string, avoid indentation issues)
-          $notesLines = @(
-            "Auto-built from upstream with promotion menu removed.",
+          $notes = @(
+            "基于上游正式 Release 自动构建，已移除推广菜单。",
             "",
-            "- Upstream code version: ${{ steps.ver.outputs.version }}",
-            "- Variant: NoAds / 去广告",
-            "- Build: win-x64, self-contained",
-            "- Included: AmazTool.exe + bin/",
-            "- Upstream bin source: $upTag ($upAsset)"
-          )
-          $notes = ($notesLines -join "`n")
+            "- 上游版本：$sourceTag",
+            "- 上游提交：$sourceSha",
+            "- 构建平台：Windows x64 / self-contained",
+            "- 包含：v2rayN.exe、AmazTool.exe、bin/",
+            "- 文件：$asset",
+            "- 大小：$bytes bytes",
+            "- SHA-256：$sha256"
+          ) -join [Environment]::NewLine
 
-          # Ensure release exists; if not, create
           gh release view $tag --repo $repo *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo $repo --title $title --notes $notes
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag" }
-          } else {
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          if ($releaseExists) {
             gh release edit $tag --repo $repo --title $title --notes $notes --latest
-            if ($LASTEXITCODE -ne 0) { throw "Failed to edit release $tag" }
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update release $tag" }
+          }
+          else {
+            gh release create $tag `
+              --repo $repo `
+              --target "${{ github.sha }}" `
+              --title $title `
+              --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create release $tag" }
           }
 
-          # Delete existing asset (ignore errors), then upload with clobber
           gh release delete-asset $tag $asset --repo $repo --yes 2>$null
           gh release upload $tag $zip --repo $repo --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Failed to upload asset to release $tag" }
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload $asset to $tag" }
 
-          Write-Host "✅ Release updated: https://github.com/$repo/releases/tag/$tag"
+          Write-Host "Release published: https://github.com/$repo/releases/tag/$tag"
